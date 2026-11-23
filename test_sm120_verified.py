@@ -58,16 +58,36 @@ def main():
         return 1
     
     print(f"  Found {len(configs)} compiled configs:")
-    for c in configs[:3]:  # Show first 3
+    for c in configs[:5]:  # Show first 5
         print(f"    {c.tile_size_m}x{c.tile_size_n}x{c.tile_size_k} R={c.R} stages={c.pipeline_stages}")
     
-    # Select smallest config (least memory, most likely to work)
-    mc = min(configs, key=lambda c: c.tile_size_m * c.tile_size_n * c.tile_size_k)
-    print(f"  Selected: {mc.tile_size_m}x{mc.tile_size_n}x{mc.tile_size_k} R={mc.R} stages={mc.pipeline_stages}")
+    # CRITICAL: Verify configs are compatible with sm_120
+    # sm_120 requires stages=2 (99KB SMEM limit)
+    # Hopper configs have stages=3 and large tiles (>99KB)
+    hopper_configs = [c for c in configs if c.pipeline_stages > 2]
+    if hopper_configs and cc[0] == 12:
+        print(f"  ✗ FATAL: Found {len(hopper_configs)} Hopper-only configs (stages>2)")
+        print("  This means kernels were compiled with PEARL_GEMM_ARCH=sm_90a (default)")
+        print("  but running on sm_120 hardware.")
+        print()
+        print("  REBUILD REQUIRED:")
+        print("    export PEARL_GEMM_ARCH=sm_120a")
+        print("    export PEARL_GEMM_FORCE_BUILD=1")
+        print("    uv pip install -e miner/pearl-gemm --no-deps --no-build-isolation")
+        print()
+        print("  Refusing to run with incompatible configs.")
+        return 1
     
-    # Verify it's a stages=2 config (sm_120 requirement)
-    if mc.pipeline_stages != 2:
-        print(f"  ⚠ WARNING: Expected stages=2 for sm_120, got stages={mc.pipeline_stages}")
+    # Filter to sm_120-compatible configs (stages=2)
+    sm120_configs = [c for c in configs if c.pipeline_stages == 2]
+    if not sm120_configs:
+        print("  ✗ FAIL: No stages=2 configs found (required for sm_120)")
+        return 1
+    
+    # Select smallest sm_120-compatible config
+    mc = min(sm120_configs, key=lambda c: c.tile_size_m * c.tile_size_n * c.tile_size_k)
+    print(f"  Selected: {mc.tile_size_m}x{mc.tile_size_n}x{mc.tile_size_k} R={mc.R} stages={mc.pipeline_stages}")
+    print(f"  Using {len(sm120_configs)}/{len(configs)} sm_120-compatible configs")
     print()
     
     # ========== TEST 3: Tensor Setup ==========
