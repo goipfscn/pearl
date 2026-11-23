@@ -742,10 +742,20 @@ class NoisingKernelB {
 
       // Load B to registers
       pipeline_B.consumer_wait(smem_pipe_read_B);
-      cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, smem_pipe_read_B.index()),
-                 taccCrB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Only 32 threads participate
+      if (tid < 32) {
+#endif
+        cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, smem_pipe_read_B.index()),
+                   taccCrB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       cutlass::arch::NamedBarrier::sync(
           kNumBpEBThreads, static_cast<uint32_t>(NamedBarriers::S2RCopyBDone));
+#else
+      }
+      cutlass::arch::NamedBarrier::sync(
+          32, static_cast<uint32_t>(NamedBarriers::S2RCopyBDone));
+#endif
       cutlass::arch::fence_view_async_shared();
       pipeline_B.consumer_release(smem_pipe_read_B);
       ++smem_pipe_read_B;
@@ -757,10 +767,16 @@ class NoisingKernelB {
       permute_Aregs_fp8(tCrBpEB_int8);
 
       // Add B to EB
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(taccCrB_int8); ++i) {
-        taccCrB_int8[i] += tCrBpEB_int8[i];
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {
+#endif
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(taccCrB_int8); ++i) {
+          taccCrB_int8[i] += tCrBpEB_int8[i];
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
       }
+#endif
 
       // RMEM->SMEM copy for BpEB to "stage" it for TMA_STORE
       pipeline_BpEB.producer_acquire(smem_pipe_write_BpEB);
