@@ -721,8 +721,16 @@ class NoisingKernelA {
       // Convert down from int32 accumulator to int8
       pearl::convert_type_out(tCrApEA, tCrApEA_int8);
 
-      // Shuffle to allow for bank conflict free store and load
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
+      // SM90: Shuffle WGMMA accumulator layout to match ldmatrix layout
+      // permute_Aregs_fp8 converts WGMMA thread-value assignment to ldmatrix/stmatrix layout
       permute_Aregs_fp8(tCrApEA_int8);
+#else
+      // SM80: SM80_16x8x32 MMA atom produces different accumulator layout than WGMMA.
+      // permute_Aregs_fp8 is WGMMA-specific and scrambles SM80 data.
+      // TODO: Derive SM80 MMA accumulator layout vs ldmatrix layout and implement correct mapping.
+      // For now, skip permutation and investigate whether SM80 MMA + ldmatrix are compatible.
+#endif
 
       // Load A to registers
       pipeline_a.consumer_wait(smem_pipe_read_a);
