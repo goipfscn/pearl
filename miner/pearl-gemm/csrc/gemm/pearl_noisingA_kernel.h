@@ -571,13 +571,15 @@ class NoisingKernelA {
       warpgroup_arrive();
 #endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-      // SM80: Stage operands SMEM → register (use TiledCopy, not ThrCopy)
-      auto a_idx = smem_pipe_read_a.index();
-      auto ebl_idx = smem_pipe_read_ebl.index();
-      cute::copy(s2r_tiled_copy_A, tCsA_s2r(_, _, _, a_idx), tCrAi_view(_, _, _, a_idx));
-      cute::copy(s2r_tiled_copy_B, tCsEBL_s2r(_, _, _, ebl_idx), tCrEBLi_view(_, _, _, ebl_idx));
-      cute::transform(tCrAi(_, _, _, a_idx), tCrA(_, _, _, a_idx), cute::identity{});
-      cute::transform(tCrEBLi(_, _, _, ebl_idx), tCrEBL(_, _, _, ebl_idx), cute::identity{});
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto a_idx = smem_pipe_read_a.index();
+        auto ebl_idx = smem_pipe_read_ebl.index();
+        cute::copy(s2r_tiled_copy_A, tCsA_s2r(_, _, _, a_idx), tCrAi_view(_, _, _, a_idx));
+        cute::copy(s2r_tiled_copy_B, tCsEBL_s2r(_, _, _, ebl_idx), tCrEBLi_view(_, _, _, ebl_idx));
+        cute::transform(tCrAi(_, _, _, a_idx), tCrA(_, _, _, a_idx), cute::identity{});
+        cute::transform(tCrEBLi(_, _, _, ebl_idx), tCrEBL(_, _, _, ebl_idx), cute::identity{});
+      }
 #endif
       // MMA: int8 × int8 → int32
       gemm(tiled_mma, tCrA(_, _, _, smem_pipe_read_a.index()),
@@ -698,12 +700,14 @@ class NoisingKernelA {
       warpgroup_arrive();
 #endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-      // SM80: Stage operands SMEM → register (use TiledCopy, not ThrCopy)
-      auto ear_idx = smem_pipe_read_ear.index();
-      cute::copy(s2r_tiled_copy_EAL_A, tCsEAL_s2r, tCrEALi_view);
-      cute::copy(s2r_tiled_copy_EAL_B, tCsEAR_s2r(_, _, _, ear_idx), tCrEARi_view(_, _, _, ear_idx));
-      cute::transform(tCrEALi, tCrEAL, cute::identity{});
-      cute::transform(tCrEARi(_, _, _, ear_idx), tCrEAR(_, _, _, ear_idx), cute::identity{});
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto ear_idx = smem_pipe_read_ear.index();
+        cute::copy(s2r_tiled_copy_EAL_A, tCsEAL_s2r, tCrEALi_view);
+        cute::copy(s2r_tiled_copy_EAL_B, tCsEAR_s2r(_, _, _, ear_idx), tCrEARi_view(_, _, _, ear_idx));
+        cute::transform(tCrEALi, tCrEAL, cute::identity{});
+        cute::transform(tCrEARi(_, _, _, ear_idx), tCrEAR(_, _, _, ear_idx), cute::identity{});
+      }
 #endif
       gemm(tiled_mma, tCrEAL, tCrEAR(_, _, _, smem_pipe_read_ear.index()),
            tCrApEA);

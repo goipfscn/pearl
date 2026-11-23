@@ -590,13 +590,15 @@ class NoisingKernelB {
       warpgroup_arrive();
 #endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-      // SM80: Stage operands SMEM → register (use TiledCopy, not ThrCopy)
-      auto bpeb_idx = smem_pipe_read_BpEB.index();
-      auto ear_idx = smem_pipe_read_EAR.index();
-      cute::copy(s2r_tiled_copy_A, tCsBpEB_s2r(_, _, _, bpeb_idx), tCrBpEBi_view(_, _, _, bpeb_idx));
-      cute::copy(s2r_tiled_copy_B, tCsEAR_s2r(_, _, _, ear_idx), tCrEARi_view(_, _, _, ear_idx));
-      cute::transform(tCrBpEBi(_, _, _, bpeb_idx), tCrBpEB(_, _, _, bpeb_idx), cute::identity{});
-      cute::transform(tCrEARi(_, _, _, ear_idx), tCrEAR(_, _, _, ear_idx), cute::identity{});
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto bpeb_idx = smem_pipe_read_BpEB.index();
+        auto ear_idx = smem_pipe_read_EAR.index();
+        cute::copy(s2r_tiled_copy_A, tCsBpEB_s2r(_, _, _, bpeb_idx), tCrBpEBi_view(_, _, _, bpeb_idx));
+        cute::copy(s2r_tiled_copy_B, tCsEAR_s2r(_, _, _, ear_idx), tCrEARi_view(_, _, _, ear_idx));
+        cute::transform(tCrBpEBi(_, _, _, bpeb_idx), tCrBpEB(_, _, _, bpeb_idx), cute::identity{});
+        cute::transform(tCrEARi(_, _, _, ear_idx), tCrEAR(_, _, _, ear_idx), cute::identity{});
+      }
 #endif
       // MMA: BpEB × EAR → EARxBpEB
       gemm(tiled_mma, tCrBpEB(_, _, _, smem_pipe_read_BpEB.index()),
@@ -718,12 +720,14 @@ class NoisingKernelB {
       warpgroup_arrive();
 #endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-      // SM80: Stage operands SMEM → register (use TiledCopy, not ThrCopy)
-      auto ebl_idx = smem_pipe_read_EBL.index();
-      cute::copy(s2r_tiled_copy_EBR_A, tCsEBR_s2r, tCrEBRi_view);
-      cute::copy(s2r_tiled_copy_EBR_B, tCsEBL_s2r(_, _, _, ebl_idx), tCrEBLi_view(_, _, _, ebl_idx));
-      cute::transform(tCrEBRi, tCrEBR, cute::identity{});
-      cute::transform(tCrEBLi(_, _, _, ebl_idx), tCrEBL(_, _, _, ebl_idx), cute::identity{});
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto ebl_idx = smem_pipe_read_EBL.index();
+        cute::copy(s2r_tiled_copy_EBR_A, tCsEBR_s2r, tCrEBRi_view);
+        cute::copy(s2r_tiled_copy_EBR_B, tCsEBL_s2r(_, _, _, ebl_idx), tCrEBLi_view(_, _, _, ebl_idx));
+        cute::transform(tCrEBRi, tCrEBR, cute::identity{});
+        cute::transform(tCrEBLi(_, _, _, ebl_idx), tCrEBL(_, _, _, ebl_idx), cute::identity{});
+      }
 #endif
       gemm(tiled_mma, tCrEBR, tCrEBL(_, _, _, smem_pipe_read_EBL.index()),
            tCrBpEB);
