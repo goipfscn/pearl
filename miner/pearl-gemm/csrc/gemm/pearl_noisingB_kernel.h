@@ -120,9 +120,9 @@ class NoisingKernelB {
   The operands are both sourced from SMEM, but accumulator is in RMEM.
   */
   using TiledMmaNKR = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NKR>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockN>, cute::Underscore, cute::Underscore>{}));
 
   /*
   Smem layouts for the smem tensors, used primarily for TMA and WGMMA. Sizes are
@@ -251,9 +251,9 @@ class NoisingKernelB {
   // accumulator.
   using TileShape_NKR_half = Shape<Int<kBlockN>, Int<kBlockK / 2>, Int<R>>;
   using TiledMmaNKR_half = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NKR_half>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockN>, cute::Underscore, cute::Underscore>{}));
   using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
   using R2SCopyAtomB = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
 
