@@ -39,7 +39,10 @@ def test_simple_gemm():
     """Test 3: Simplest possible GEMM launch."""
     print("\nTest 3: Simple GEMM kernel launch")
     try:
-        from pearl_gemm.test_components import noisy_gemm, GemmTensorGenerator, GEMMParam
+        # Correct imports from actual pearl_gemm structure
+        from pearl_gemm import noisy_gemm
+        from pearl_gemm.testing.gemm_param import GEMMParam
+        from pearl_gemm.testing.gemm_tensor_generator import GemmTensorGenerator
         from pearl_gemm_build_utils.kernel_configs import KERNEL_CONFIGS
         
         # Use smallest compiled config
