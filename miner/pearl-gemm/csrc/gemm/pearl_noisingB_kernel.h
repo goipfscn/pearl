@@ -659,6 +659,20 @@ class NoisingKernelB {
     // (1, REST_K, REST_R) -- tensor of WGMMA descriptors, 1 per atom
     Tensor tCrEBL = thr_mma.make_fragment_B(tCsEBL);
 
+    // SM80 staging setup for EBR×EBL GEMM
+    Tensor tCrEBRi = make_fragment_like<Element>(tCrEBR);
+    Tensor tCrEBLi = make_fragment_like<Element>(tCrEBL);
+    using S2RCopyAtomEBR_A = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using S2RCopyAtomEBR_B = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    auto s2r_tiled_copy_EBR_A = make_tiled_copy_A(S2RCopyAtomEBR_A{}, thr_mma);
+    auto s2r_tiled_copy_EBR_B = make_tiled_copy_B(S2RCopyAtomEBR_B{}, thr_mma);
+    auto s2r_thr_copy_EBR_A = s2r_tiled_copy_EBR_A.get_thread_slice(tid);
+    auto s2r_thr_copy_EBR_B = s2r_tiled_copy_EBR_B.get_thread_slice(tid);
+    Tensor tCsEBR_s2r = s2r_thr_copy_EBR_A.partition_S(sEBR);
+    Tensor tCsEBL_s2r = s2r_thr_copy_EBR_B.partition_S(sEBL);
+    Tensor tCrEBRi_view = s2r_thr_copy_EBR_A.retile_D(tCrEBRi);
+    Tensor tCrEBLi_view = s2r_thr_copy_EBR_B.retile_D(tCrEBLi);
+
     // Wait for EBR load. It does not change with K, so only once
     uint64_t* EBR_mbar = &shared_storage.EBR_mbar;
     ProducerBarType::wait(EBR_mbar, 0);

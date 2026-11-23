@@ -639,6 +639,20 @@ class NoisingKernelA {
     // (1, REST_K, REST_R) -- tensor of WGMMA descriptors, 1 per atom
     Tensor tCrEAR = thr_mma.make_fragment_B(tCsEAR);
 
+    // SM80 staging setup for EAL×EAR GEMM
+    Tensor tCrEALi = make_fragment_like<Element>(tCrEAL);
+    Tensor tCrEARi = make_fragment_like<Element>(tCrEAR);
+    using S2RCopyAtomEAL_A = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using S2RCopyAtomEAL_B = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    auto s2r_tiled_copy_EAL_A = make_tiled_copy_A(S2RCopyAtomEAL_A{}, thr_mma);
+    auto s2r_tiled_copy_EAL_B = make_tiled_copy_B(S2RCopyAtomEAL_B{}, thr_mma);
+    auto s2r_thr_copy_EAL_A = s2r_tiled_copy_EAL_A.get_thread_slice(tid);
+    auto s2r_thr_copy_EAL_B = s2r_tiled_copy_EAL_B.get_thread_slice(tid);
+    Tensor tCsEAL_s2r = s2r_thr_copy_EAL_A.partition_S(sEAL);
+    Tensor tCsEAR_s2r = s2r_thr_copy_EAL_B.partition_S(sEAR);
+    Tensor tCrEALi_view = s2r_thr_copy_EAL_A.retile_D(tCrEALi);
+    Tensor tCrEARi_view = s2r_thr_copy_EAL_B.retile_D(tCrEARi);
+
     // Wait for EAL load. It does not change with K, so only once
     uint64_t* eal_mbar = &shared_storage.eal_mbar;
     ProducerBarType::wait(eal_mbar, 0);
