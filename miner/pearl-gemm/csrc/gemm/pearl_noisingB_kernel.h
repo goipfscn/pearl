@@ -98,19 +98,18 @@ class NoisingKernelB {
   using AtomLayoutMma = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
 
   /*
-  Tiled WGMMA for EAR * BpEB, int8 * int8 -> int32, size (bN, R, bK) for one k_block.
-  The op selector will select the appropriate GMEM Atom; it will try to fill 0-mode
-  and 1-mode, and tile along 2-mode (which must be 32). So we will get bNxRx32 atom.
-  The only supported atom size in the n-mode is 64, so bN%64==0. The warpspecialized
-  kernel assigns warpgroup 1 to handle EAR * BpEB, and because we only use one WG the
-  atom layout is trivial. Each WGMMA consumes one BpEB tile (bN,bK) and one EAR tile (R,bK).
+  Tiled MMA for EAR * BpEB, int8 * int8 -> int32, size (bN, R, bK) for one k_block.
+  SM90: WGMMA with ss_op_selector for bNxRx32 atom.
+  SM80: m16n8k32 MMA atom (Blackwell consumer fallback).
+  The warpspecialized kernel assigns warpgroup 1 to handle EAR * BpEB.
+  Each MMA consumes one BpEB tile (bN,bK) and one EAR tile (R,bK).
   The operands are both sourced from SMEM and must have a specific layout; this
   layout is handled by swizzles in the SMEM layouts.
   */
   using TiledMmaNRK = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NRK>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockN>, cute::Underscore, cute::Underscore>{}));
 
   /*
   Tiled WGMMA for B + EBR * EBL, size (bN, bK, R) for one k_block iteration.
