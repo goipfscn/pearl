@@ -727,27 +727,31 @@ class NoisingKernelA {
       // Load A to registers
       pipeline_a.consumer_wait(smem_pipe_read_a);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-      // SM80: Only 32 threads participate. Guard S2R and addition.
+      // SM80: Only 32 threads (tid 0-31) participate in MMA and have valid data.
+      // Threads 32-127 must skip S2R, addition, sync, and R2S.
       if (tid < 32) {
 #endif
         cute::copy(s2r_tiled_copy_A, taccCsA(_, _, _, smem_pipe_read_a.index()),
                    taccCrA);
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-      cutlass::arch::NamedBarrier::sync(
-          kNumApEAThreads, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        // SM80: Only participating threads sync
+        cutlass::arch::NamedBarrier::sync(
+            32, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
 #else
-      }
-      // SM80: Sync only participating threads
-      cutlass::arch::NamedBarrier::sync(
-          32, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
+        // SM90: All warpgroup threads sync
+        cutlass::arch::NamedBarrier::sync(
+            kNumApEAThreads, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
 #endif
-      cutlass::arch::fence_view_async_shared();
+        cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
       pipeline_a.consumer_release(smem_pipe_read_a);
       ++smem_pipe_read_a;
 
       // Add A to EA
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-      if (tid < 32) {  // SM80: Only threads with valid data
+      if (tid < 32) {
 #endif
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(taccCrA_int8); ++i) {
