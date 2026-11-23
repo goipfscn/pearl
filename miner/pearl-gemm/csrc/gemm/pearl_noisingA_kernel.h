@@ -738,8 +738,16 @@ class NoisingKernelA {
 
       // RMEM->SMEM copy for ApEA to "stage" it for TMA_STORE
       pipeline_apea.producer_acquire(smem_pipe_write_apea);
-      cute::copy(r2s_tiled_copy_A, taccCrA,
-                 taccCsApEA(_, _, _, smem_pipe_write_apea.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Only 32 threads (1 warp) participate in m16n8k32 MMA.
+      // Threads 32-127 have uninitialized taccCrA and must not write to SMEM.
+      if (tid < 32) {
+#endif
+        cute::copy(r2s_tiled_copy_A, taccCrA,
+                   taccCsApEA(_, _, _, smem_pipe_write_apea.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
       cutlass::arch::fence_view_async_shared();
       pipeline_apea.producer_commit(smem_pipe_write_apea);
       ++smem_pipe_write_apea;
@@ -782,11 +790,23 @@ class NoisingKernelA {
       }
       Tensor tR2SrAxEBL = r2s_thr_copy_O.retile_S(
           tCrAxEBL_out);  // ((Atom,AtomNum), MMA_M, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     } else {
       Tensor tR2SrAxEBL =
           r2s_thr_copy_O.retile_S(tCrAxEBL);  // ((Atom,AtomNum), MMA_M, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     }
 
     // ensure smem writes are completed and visible to TMA

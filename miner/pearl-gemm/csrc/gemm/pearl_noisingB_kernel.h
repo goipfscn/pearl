@@ -761,8 +761,14 @@ class NoisingKernelB {
 
       // RMEM->SMEM copy for BpEB to "stage" it for TMA_STORE
       pipeline_BpEB.producer_acquire(smem_pipe_write_BpEB);
-      cute::copy(r2s_tiled_copy_B, taccCrB,
-                 taccCsBpEB(_, _, _, smem_pipe_write_BpEB.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_B, taccCrB,
+                   taccCsBpEB(_, _, _, smem_pipe_write_BpEB.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
       pipeline_BpEB.producer_commit(smem_pipe_write_BpEB);
       ++smem_pipe_write_BpEB;
     }
@@ -809,11 +815,23 @@ class NoisingKernelB {
       }
       Tensor tR2SrEARxBpEB = r2s_thr_copy_O.retile_S(
           tCrEARxBpEB_out);  // ((Atom,AtomNum), MMA_N, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     } else {
       Tensor tR2SrEARxBpEB = r2s_thr_copy_O.retile_S(
           tCrEARxBpEB);  // ((Atom,AtomNum), MMA_N, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     }
 
     // ensure smem writes are completed and visible to TMA
