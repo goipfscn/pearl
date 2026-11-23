@@ -567,16 +567,20 @@ class NoisingKernelB {
       pipeline_BpEB.consumer_wait(smem_pipe_read_BpEB);
       pipeline_EAR.consumer_wait(smem_pipe_read_EAR);
       cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrEARxBpEB);
       warpgroup_arrive();
+#endif
       // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
       gemm(tiled_mma, tCrBpEB(_, _, _, smem_pipe_read_BpEB.index()),
            tCrEAR(_, _, _, smem_pipe_read_EAR.index()), tCrEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       // Wait for all MMAs across warp group to complete
       warpgroup_wait<0>();
 
       warpgroup_fence_operand(tCrEARxBpEB);
+#endif
 
       cutlass::arch::fence_view_async_shared();
       pipeline_BpEB.consumer_release(smem_pipe_read_BpEB);
@@ -668,13 +672,17 @@ class NoisingKernelB {
       clear(tCrBpEB);  // We store every iter so we need to clear
       // WGMMA: B + EBR * EBL
       pipeline_EBL.consumer_wait(smem_pipe_read_EBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrBpEB);
       warpgroup_arrive();
+#endif
       gemm(tiled_mma, tCrEBR, tCrEBL(_, _, _, smem_pipe_read_EBL.index()),
            tCrBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       warpgroup_wait<0>();
       warpgroup_fence_operand(tCrBpEB);
+#endif
 
       pipeline_EBL.consumer_release(smem_pipe_read_EBL);
       ++smem_pipe_read_EBL;

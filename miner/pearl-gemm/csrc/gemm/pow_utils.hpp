@@ -168,8 +168,10 @@ struct TileHashAccumulator {
     ++m_k_block_count;
     if ((m_k_block_count % ReduceEveryK == 0) &&
         (m_k_block_count <= m_last_full_k_block)) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_wait<0>();
       warpgroup_fence_operand(tensor);
+#endif
       if constexpr (EnableDebug) {
         atomicAdd((unsigned long long*)m_debug_counter, 1ULL);
       }
