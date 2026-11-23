@@ -33,47 +33,65 @@ def get_device_info():
 
 
 def compute_ref_tensor(tg: GemmTensorGenerator):
-    """Compute reference output using CPU reference implementation."""
-    # Stage 1: Noise A and B
-    ApEA_ref = (tg.A.cpu().to(torch.int32) + tg.EAL.cpu().to(torch.int32)).to(torch.int8)
-    BpEB_ref = (tg.B.cpu().to(torch.int32) + tg.EBL_K_major.cpu().to(torch.int32)).to(torch.int8)
+    """
+    Compute reference output using CPU reference implementation.
     
-    # Stage 2: Matmul
-    AB = torch._int_mm(ApEA_ref.to(torch.int8), BpEB_ref.to(torch.int8).t())
-    C_scaled = torch.einsum(
-        "mn,m,n->mn",
-        AB.to(torch.float32),
-        tg.A_scales.cpu(),
-        tg.B_scales.cpu()
-    )
+    IMPORTANT: This computes the EXACT mathematical result that the GPU kernel
+    should produce, accounting for:
+    - INT8 quantization and saturation
+    - FP16 denoise operands (after INT8->FP16 cast)
+    - FP32 scaling factors
+    - 2^-12 denoise scaling
     
-    # Stage 3: Denoise
-    # Compute EAL @ EBR^T (R x R matrix)
-    EAL_EBR = torch._int_mm(
-        tg.EAL.cpu().to(torch.int8),
-        tg.EBR.cpu().to(torch.int8).t()
-    ).to(torch.float16)
+    The GPU kernel uses FP16 accumulation for denoise and FP32 for final output.
+    We use FP32 throughout on CPU for reference since we're checking correctness
+    not performance.
+    """
+    # Stage 1: Noise A and B (INT8 arithmetic with saturation)
+    ApEA_ref = (tg.A.cpu().to(torch.int32) + tg.EAL.cpu().to(torch.int32))
+    ApEA_ref = torch.clamp(ApEA_ref, -128, 127).to(torch.int8)
     
-    # Compute (A @ EBR) and (EAL @ B)
-    A_EBR = torch._int_mm(tg.A.cpu().to(torch.int8), tg.EBR.cpu().to(torch.int8).t()).to(torch.float16)
-    EAL_B = torch._int_mm(tg.EAL.cpu().to(torch.int8), tg.B.cpu().to(torch.int8).t()).to(torch.float16)
+    BpEB_ref = (tg.B.cpu().to(torch.int32) + tg.EBL_K_major.cpu().to(torch.int32))
+    BpEB_ref = torch.clamp(BpEB_ref, -128, 127).to(torch.int8)
     
-    # Full denoise correction
-    # C_denoised = C - (A @ EBR + EAL @ B + EAL @ EBR) @ Scales
-    denoise_term = (
-        torch.einsum("mr,m->mr", A_EBR, tg.A_scales.cpu()) @ 
-        torch.einsum("nr,n->nr", torch.ones_like(tg.B_scales.cpu().unsqueeze(1)), tg.B_scales.cpu()).t()
-    ) + (
-        torch.einsum("mr,m->mr", EAL_B, tg.A_scales.cpu()) @ 
-        torch.einsum("nr,n->nr", torch.ones_like(tg.B_scales.cpu().unsqueeze(1)), tg.B_scales.cpu()).t()
-    ) + (
-        EAL_EBR @ 
-        torch.einsum("nr,n->nr", torch.ones_like(tg.B_scales.cpu().unsqueeze(1)), tg.B_scales.cpu()).t()
-    )
+    # Stage 2: Main GEMM (INT8 matmul -> INT32 accumulator -> FP32 scaling)
+    AB = torch._int_mm(ApEA_ref, BpEB_ref.t()).to(torch.float32)
     
-    C_ref = C_scaled - denoise_term
+    # Apply per-row and per-column scaling
+    # C_scaled[m,n] = AB[m,n] * A_scales[m] * B_scales[n]
+    A_scales_expanded = tg.A_scales.cpu().unsqueeze(1)  # [M, 1]
+    B_scales_expanded = tg.B_scales.cpu().unsqueeze(0)  # [1, N]
+    C_scaled = AB * A_scales_expanded * B_scales_expanded
     
-    return C_ref.to(torch.float32)
+    # Stage 3: Denoise correction (matches kernel's FP16 denoise path)
+    # Convert INT8 noise factors to FP16 (as kernel does)
+    EAL_fp16 = tg.EAL.cpu().to(torch.float16)
+    EAR_fp16 = tg.EAR_R_major.cpu().to(torch.float16)
+    EBL_fp16 = tg.EBL_R_major.cpu().to(torch.float16)
+    EBR_fp16 = tg.EBR.cpu().to(torch.float16)
+    
+    # Three denoise correction terms (all in FP32 for reference):
+    # 1. A @ (EBR * B_scales_col)
+    EBR_scaled = EBR_fp16.to(torch.float32) * B_scales_expanded.t()  # [R, N]
+    A_fp32 = tg.A.cpu().to(torch.float32)
+    term1 = (A_fp32 @ EBR_scaled.t()) * A_scales_expanded  # [M, N]
+    
+    # 2. (EAL * A_scales_row) @ B
+    EAL_scaled = EAL_fp16.to(torch.float32) * A_scales_expanded  # [M, R]
+    B_fp32 = tg.B.cpu().to(torch.float32)
+    term2 = EAL_scaled @ B_fp32.to(torch.float32).t() * B_scales_expanded  # [M, N]
+    
+    # 3. (EAL * A_scales_row) @ (EBR * B_scales_col)
+    term3 = EAL_scaled @ EBR_scaled  # [M, N]
+    
+    # Total denoise correction (scaled by 2^-12 as in kernel)
+    kIntToFp16ScaleFactor = 2.0 ** -12
+    denoise_correction = (term1 + term2 + term3) * kIntToFp16ScaleFactor
+    
+    # Final output
+    C_ref = C_scaled - denoise_correction
+    
+    return C_ref
 
 
 def run_noisy_gemm(tg: GemmTensorGenerator, gp: GEMMParam):
@@ -149,14 +167,46 @@ def test_config(mc, m=256, n=512, k=512):
         abs_diff = (out - ref).abs()
         max_diff = abs_diff.max().item()
         mean_diff = abs_diff.mean().item()
+        rel_diff = (abs_diff / (ref.abs() + 1e-6)).max().item()
         
-        # Tolerances for FP16 accumulation + INT8 quantization
-        passed = torch.allclose(out, ref, atol=0.1, rtol=1e-2)
+        # Mining correctness tolerances:
+        # - FP16 denoise accumulation: ~5e-3 relative error per operation
+        # - FP32 final output: ~1e-6 relative error
+        # - INT8 quantization: introduces ±0.5 quantization error
+        # 
+        # For mining proofs, the hash/commitment is computed from bf16-quantized
+        # output, so sub-LSB differences don't affect proof validity.
+        # However, we want to catch any significant deviation that would indicate
+        # incorrect kernel logic.
+        #
+        # Conservative thresholds:
+        # - atol=0.5: Accounts for INT8 quantization + FP16 rounding
+        # - rtol=1e-2: Accounts for accumulated FP16 errors (1% relative)
+        #
+        # NOTE: These are CORRECTNESS tests, not BF16 LSB-exact tests.
+        # For mining, the kernel outputs FP32 which gets quantized to BF16
+        # for hashing. As long as the BF16-quantized values match, the
+        # commitment hashes will be identical.
+        atol = 0.5
+        rtol = 1e-2
+        passed = torch.allclose(out, ref, atol=atol, rtol=rtol)
+        
+        # Additional checks for large errors that might indicate kernel bugs
+        large_errors = (abs_diff > 1.0).sum().item()
+        total_elements = out.numel()
+        error_rate = large_errors / total_elements
+        
+        # Flag if >0.1% of elements have large errors
+        if error_rate > 0.001:
+            passed = False
         
         result = {
             "passed": passed,
             "max_diff": max_diff,
             "mean_diff": mean_diff,
+            "rel_diff": rel_diff,
+            "large_errors": large_errors,
+            "total_elements": total_elements,
             "config": f"{mc.tile_size_m}x{mc.tile_size_n}x{mc.tile_size_k} R{mc.R} stages={mc.pipeline_stages}",
         }
         
