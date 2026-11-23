@@ -255,7 +255,12 @@ class NoisingKernelB {
       AtomLayoutMma{},
       cute::Tile<cute::Int<kBlockN>, cute::Underscore, cute::Underscore>{}));
   using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
+  // R2S: SM90 STSM on Hopper, AutoVectorizing on Blackwell consumer / SM80 fallback
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  using R2SCopyAtomB = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, uint16_t>;
+#else
   using R2SCopyAtomB = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
+#endif
 
   // Defining load pipeline types (initialized in kernel). Used by B, EAR and EBL
   using MainloopLoadPipeline = typename cutlass::PipelineTmaAsync<kStages>;
