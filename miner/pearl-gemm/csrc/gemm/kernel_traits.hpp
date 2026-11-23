@@ -63,6 +63,23 @@ struct KernelTraits {
   static constexpr int kClusterSizeM = cM_;
   static constexpr int kClusterSizeN = cN_;
   using ClusterShape_MNK = Shape<Int<kClusterSizeM>, Int<kClusterSizeN>, _1>;
+
+  // Architecture-specific MMA and TMA operations
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  // Blackwell (sm_100/120/121): Use SM80 mma.sync fallback
+  // Blackwell does not support Hopper's WGMMA/TMA instructions
+  using TMAOpA = void;  // No TMA on Blackwell, will use async copy
+  using TMAOpB = void;
+  
+  // SM80-style int8 MMA: 16x8x32 with S32 accumulator
+  using MmaAtom = cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>;
+  using AtomLayoutMNK = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+  using TiledMma = decltype(cute::make_tiled_mma(MmaAtom{}, AtomLayoutMNK{}));
+  using MMATraits = typename TiledMma::Atom::Traits;
+  using MMAAtomShape_MNK = typename TiledMma::AtomShape_MNK;
+  using MMAAtom_K = decltype(get<2>(MMAAtomShape_MNK{}));
+#else
+  // Hopper (sm_90a): Use WGMMA with TMA
   // Multicasting to a single CTA has been known to be worse perf than non-multicast
   using TMAOpA =
       std::conditional_t<(kClusterSizeN > 1), cute::SM90_TMA_LOAD_MULTICAST,
@@ -79,6 +96,7 @@ struct KernelTraits {
   using MMATraits = typename TiledMma::Atom::Traits;
   using MMAAtomShape_MNK = typename TiledMma::AtomShape_MNK;
   using MMAAtom_K = decltype(get<2>(MMAAtomShape_MNK{}));
+#endif
 
   // Fake warp layout and warp tile shape for reduce_buffer permutation
   // We assume <= 2 MMA warpgroups which are always tiled in the M direction.
@@ -115,9 +133,21 @@ struct KernelTraits {
   using SmemLayoutC =
       decltype(tile_to_shape(SmemLayoutAtomC{}, select<0, 1>(TileShape_MNK{})));
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  // Blackwell: Use standard async copy instead of SM90_U32x4_STSM_N
+  using SmemCopyAtomC = Copy_Atom<cute::UniversalCopy<uint32_t>, ElementOut>;
+#else
+  // Hopper: Use SM90-specific store
   using SmemCopyAtomC = Copy_Atom<cute::SM90_U32x4_STSM_N, ElementOut>;
+#endif
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  // Blackwell: Use standard async pipeline (no TMA)
+  using MainloopPipeline = typename cutlass::PipelineAsync<kStages>;
+#else
+  // Hopper: Use TMA-based pipeline
   using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
+#endif
 
   // Probably don't need more than 1 stage here because denoise load latency
   // is well-hidden under the rest of the matmul
@@ -141,10 +171,19 @@ struct KernelTraits {
   // Denoising
   // MMA
   using AtomLayoutMNR = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  // Blackwell: SM80 mma.sync for FP16 denoise operations
+  static_assert(is_same_v<ElementDenoise, half_t>,
+                "Blackwell path requires FP16 denoise operands");
+  using MmaAtomDenoise = cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>;
+  using TiledMmaDenoise = decltype(cute::make_tiled_mma(MmaAtomDenoise{}, AtomLayoutMNR{}));
+#else
+  // Hopper: WGMMA for denoise
   using TiledMmaDenoise = decltype(cute::make_tiled_mma(
       cute::GMMA::ss_op_selector<ElementDenoise, ElementDenoise,
                                  ElementDenoiseAccum, TileShape_MNR>(),
       AtomLayoutMNR{}));
+#endif
   // SMEM layouts
   using SmemLayoutEAL_Atom =
       decltype(cutlass::gemm::collective::detail::ss_smem_selector<

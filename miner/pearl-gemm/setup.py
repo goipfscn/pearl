@@ -86,7 +86,22 @@ CORES_PER_JOB = 1
 FALLBACK_MAX_JOBS = 4
 KB_PER_GB = 1024 * 1024
 NVCC_THREAD_COUNT = "4"
-COMPUTE_CAPABILITY = "arch=compute_90a,code=sm_90a"
+
+# Architecture selection: defaults to Hopper sm_90a, override with PEARL_GEMM_ARCH
+# Supported: sm_90a (Hopper H100/H200), sm_120a/sm_121a (Blackwell RTX 50-series/GB10), sm_100a (B100/B200)
+PEARL_GEMM_ARCH = os.getenv("PEARL_GEMM_ARCH", "sm_90a")
+COMPUTE_CAPABILITY_MAP = {
+    "sm_90a": "arch=compute_90a,code=sm_90a",
+    "sm_100a": "arch=compute_100a,code=sm_100a",
+    "sm_120a": "arch=compute_120a,code=sm_120a",
+    "sm_121a": "arch=compute_121a,code=sm_121a",
+}
+if PEARL_GEMM_ARCH not in COMPUTE_CAPABILITY_MAP:
+    raise ValueError(
+        f"Unsupported PEARL_GEMM_ARCH={PEARL_GEMM_ARCH}. "
+        f"Supported: {', '.join(COMPUTE_CAPABILITY_MAP.keys())}"
+    )
+COMPUTE_CAPABILITY = COMPUTE_CAPABILITY_MAP[PEARL_GEMM_ARCH]
 
 
 def linux_total_ram_kb() -> int:
@@ -348,7 +363,8 @@ if not SKIP_CUDA_BUILD:
 
     warn_if_cuda_home_missing("pearl_gemm")
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-    print(f"cuda version = {bare_metal_version}\n\n")
+    print(f"cuda version = {bare_metal_version}")
+    print(f"target architecture = {PEARL_GEMM_ARCH} ({COMPUTE_CAPABILITY})\n\n")
     arch_flags = ["-gencode", COMPUTE_CAPABILITY]
 
     if not SKIP_CPP_GENERATION:
