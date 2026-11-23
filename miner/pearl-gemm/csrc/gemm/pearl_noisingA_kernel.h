@@ -535,9 +535,23 @@ class NoisingKernelA {
     Tensor tCsA = thr_mma.partition_A(sA);      // (MMA,MMA_M,MMA_K,P)
     Tensor tCsEBL = thr_mma.partition_B(sEBL);  // (MMA,MMA_N,MMA_K,P)
 
-    // Allocate "fragments" -- these are WGMMA matrix descriptors
+    // Allocate fragments
     Tensor tCrA = thr_mma.make_fragment_A(tCsA);      // (MMA,MMA_M,MMA_K,P)
     Tensor tCrEBL = thr_mma.make_fragment_B(tCsEBL);  // (MMA,MMA_N,MMA_K,P)
+
+    // SM80 staging setup (declared unconditionally for compilation, used conditionally)
+    Tensor tCrAi = make_fragment_like<Element>(tCrA);
+    Tensor tCrEBLi = make_fragment_like<Element>(tCrEBL);
+    using S2RCopyAtom_A = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using S2RCopyAtom_B = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    auto s2r_tiled_copy_A = make_tiled_copy_A(S2RCopyAtom_A{}, thr_mma);
+    auto s2r_tiled_copy_B = make_tiled_copy_B(S2RCopyAtom_B{}, thr_mma);
+    auto s2r_thr_copy_A = s2r_tiled_copy_A.get_thread_slice(tid);
+    auto s2r_thr_copy_B = s2r_tiled_copy_B.get_thread_slice(tid);
+    Tensor tCsA_s2r = s2r_thr_copy_A.partition_S(sA);
+    Tensor tCsEBL_s2r = s2r_thr_copy_B.partition_S(sEBL);
+    Tensor tCrAi_view = s2r_thr_copy_A.retile_D(tCrAi);
+    Tensor tCrEBLi_view = s2r_thr_copy_B.retile_D(tCrEBLi);
 
     LoadPipelineState smem_pipe_read_a;
     LoadPipelineState smem_pipe_read_ebl;
@@ -551,7 +565,16 @@ class NoisingKernelA {
       warpgroup_fence_operand(tCrAxEBL);
       warpgroup_arrive();
 #endif
-      // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Stage operands SMEM → register
+      auto a_idx = smem_pipe_read_a.index();
+      auto ebl_idx = smem_pipe_read_ebl.index();
+      cute::copy(s2r_tiled_copy_A, tCsA_s2r(_, _, _, a_idx), tCrAi_view(_, _, _, a_idx));
+      cute::copy(s2r_tiled_copy_B, tCsEBL_s2r(_, _, _, ebl_idx), tCrEBLi_view(_, _, _, ebl_idx));
+      cute::transform(tCrAi(_, _, _, a_idx), tCrA(_, _, _, a_idx), cute::identity{});
+      cute::transform(tCrEBLi(_, _, _, ebl_idx), tCrEBL(_, _, _, ebl_idx), cute::identity{});
+#endif
+      // MMA: int8 × int8 → int32
       gemm(tiled_mma, tCrA(_, _, _, smem_pipe_read_a.index()),
            tCrEBL(_, _, _, smem_pipe_read_ebl.index()), tCrAxEBL);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -648,12 +671,20 @@ class NoisingKernelA {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (int k_block = k_block_min; k_block < k_block_max; ++k_block) {
-      // WGMMA: A + EAL * EAR
+      // MMA: EAL × EAR → ApEA
       clear(tCrApEA);  // We store every iter so we need to clear
       pipeline_ear.consumer_wait(smem_pipe_read_ear);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrApEA);
       warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Stage operands SMEM → register
+      auto ear_idx = smem_pipe_read_ear.index();
+      cute::copy(s2r_thr_copy_EAL_A, tCsEAL_s2r, tCrEALi_view);
+      cute::copy(s2r_thr_copy_EAL_B, tCsEAR_s2r(_, _, _, ear_idx), tCrEARi_view(_, _, _, ear_idx));
+      cute::transform(tCrEALi, tCrEAL, cute::identity{});
+      cute::transform(tCrEARi(_, _, _, ear_idx), tCrEAR(_, _, _, ear_idx), cute::identity{});
 #endif
       gemm(tiled_mma, tCrEAL, tCrEAR(_, _, _, smem_pipe_read_ear.index()),
            tCrApEA);
