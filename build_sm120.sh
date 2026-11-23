@@ -31,11 +31,12 @@ export MAX_JOBS=${MAX_JOBS:-8}
 echo "Building for: $PEARL_GEMM_ARCH"
 echo "Max parallel jobs: $MAX_JOBS"
 
-# Install uv if needed
+# Check uv (DO NOT auto-install to avoid environment mutation)
 if ! command -v uv &> /dev/null; then
-    echo "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.cargo/bin:$PATH"
+    echo "ERROR: uv not found in PATH"
+    echo "Install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    echo "Or use system package manager to avoid global mutation"
+    exit 1
 fi
 
 # Build
