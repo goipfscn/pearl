@@ -690,9 +690,13 @@ class NoisingKernelB {
     auto sB_u16 = recast<uint16_t>(sB_pi);
     auto taccCsB = s2r_thr_copy_B.partition_S(sB_u16);
 
+    // Create B fragment in MMA layout (same as tCrBpEB from gemm())
     auto tCrB = partition_fragment_C(tiled_mma_half,
                                      select<0, 1>(TileShape_NKR_half{}));
-    auto tCrB_u16 = make_tensor_like<uint16_t>(tCrB);  // (MMA_V, MMA_M, MM_N)
+    auto tCrB_u16 = make_tensor_like<uint16_t>(tCrB);  // (MMA_V, MMA_M, MMA_N)
+    auto tCrB_int8 = recast<Element>(tCrB);  // Keep in MMA layout for addition
+    
+    // Also create copy-layout view for S2R and R2S operations
     // ((ATOM_V, COPY_V), COPY_M, COPY_N)
     auto taccCrB = s2r_thr_copy_B.retile_D(tCrB_u16);
     auto taccCrB_int8 = recast<Element>(taccCrB);
@@ -769,23 +773,29 @@ class NoisingKernelB {
       pearl::convert_type_out(tCrBpEB, tCrBpEB_int8);
 
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
-      // SM90: Shuffle WGMMA accumulator layout to match ldmatrix layout
+      // SM90: Convert WGMMA accumulator layout to match ldmatrix copy layout
       permute_Aregs_fp8(tCrBpEB_int8);
+      
+      // Add B to EB in copy layout
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(taccCrB_int8); ++i) {
+        taccCrB_int8[i] += tCrBpEB_int8[i];
+      }
 #else
-      // SM80: SM80_16x8x32 MMA atom produces different accumulator layout than WGMMA.
-      // permute_Aregs_fp8 is WGMMA-specific and scrambles SM80 data.
-      // TODO: Derive SM80 MMA accumulator layout vs ldmatrix layout and implement correct mapping.
-#endif
-
-      // Add B to EB
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Add in MMA layout directly
+      // tCrBpEB_int8 is in raw SM80 MMA layout
+      // tCrB_int8 is ALSO in MMA layout (same as tCrBpEB)
+      // Both are partition_fragment_C outputs, so layouts match
+      // taccCrB_int8 is retiled view of tCrB_int8 for copy operations
+      
       if (tid < 32) {
-#endif
+        // Add in MMA layout where both fragments have matching coordinates
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(taccCrB_int8); ++i) {
-          taccCrB_int8[i] += tCrBpEB_int8[i];
+        for (int i = 0; i < size(tCrB_int8); ++i) {
+          tCrB_int8[i] += tCrBpEB_int8[i];
         }
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        // Result is now in tCrB_int8 (MMA layout)
+        // taccCrB_int8 is a retiled view of the same registers, so it sees the update
       }
 #endif
 

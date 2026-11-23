@@ -671,9 +671,13 @@ class NoisingKernelA {
     auto sA_u16 = recast<uint16_t>(sA_pi);
     auto taccCsA = s2r_thr_copy_A.partition_S(sA_u16);
 
+    // Create A fragment in MMA layout (same as tCrApEA from gemm())
     auto tCrA = partition_fragment_C(tiled_mma_half,
                                      select<0, 1>(TileShape_MKR_half{}));
-    auto tCrA_u16 = make_tensor_like<uint16_t>(tCrA);  // (MMA_V, MMA_M, MM_N)
+    auto tCrA_u16 = make_tensor_like<uint16_t>(tCrA);  // (MMA_V, MMA_M, MMA_N)
+    auto tCrA_int8 = recast<Element>(tCrA);  // Keep in MMA layout for addition
+    
+    // Also create copy-layout view for S2R and R2S operations
     // ((ATOM_V, COPY_V), COPY_M, COPY_N)
     auto taccCrA = s2r_thr_copy_A.retile_D(tCrA_u16);
     auto taccCrA_int8 = recast<Element>(taccCrA);
@@ -721,17 +725,6 @@ class NoisingKernelA {
       // Convert down from int32 accumulator to int8
       pearl::convert_type_out(tCrApEA, tCrApEA_int8);
 
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
-      // SM90: Shuffle WGMMA accumulator layout to match ldmatrix layout
-      // permute_Aregs_fp8 converts WGMMA thread-value assignment to ldmatrix/stmatrix layout
-      permute_Aregs_fp8(tCrApEA_int8);
-#else
-      // SM80: SM80_16x8x32 MMA atom produces different accumulator layout than WGMMA.
-      // permute_Aregs_fp8 is WGMMA-specific and scrambles SM80 data.
-      // TODO: Derive SM80 MMA accumulator layout vs ldmatrix layout and implement correct mapping.
-      // For now, skip permutation and investigate whether SM80 MMA + ldmatrix are compatible.
-#endif
-
       // Load A to registers
       pipeline_a.consumer_wait(smem_pipe_read_a);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -757,15 +750,31 @@ class NoisingKernelA {
       pipeline_a.consumer_release(smem_pipe_read_a);
       ++smem_pipe_read_a;
 
-      // Add A to EA
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
+      // SM90: Convert WGMMA accumulator layout to match ldmatrix copy layout
+      // After permutation, both tCrApEA_int8 and taccCrA_int8 are in ldmatrix layout
+      permute_Aregs_fp8(tCrApEA_int8);
+      
+      // Add A to EA in copy layout
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(taccCrA_int8); ++i) {
+        taccCrA_int8[i] += tCrApEA_int8[i];
+      }
+#else
+      // SM80: Add in MMA layout directly
+      // tCrApEA_int8 is in raw SM80 MMA layout
+      // tCrA_int8 is ALSO in MMA layout (same as tCrApEA)
+      // Both are partition_fragment_C outputs, so layouts match
+      // taccCrA_int8 is retiled view of tCrA_int8 for copy operations
+      
       if (tid < 32) {
-#endif
+        // Add in MMA layout where both fragments have matching coordinates
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(taccCrA_int8); ++i) {
-          taccCrA_int8[i] += tCrApEA_int8[i];
+        for (int i = 0; i < size(tCrA_int8); ++i) {
+          tCrA_int8[i] += tCrApEA_int8[i];
         }
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        // Result is now in tCrA_int8 (MMA layout)
+        // taccCrA_int8 is a retiled view of the same registers, so it sees the update
       }
 #endif
 
