@@ -5,6 +5,16 @@
 set -e
 
 echo "=== Pearl sm_120 Simnet Mining Test - $(date) ==="
+echo ""
+echo "WARNING: This script assumes --simnet prevents mainnet contact."
+echo "Verify pearld is NOT connected to production before proceeding."
+echo ""
+read -p "Confirm production pearld is STOPPED and isolated network ready [y/N]: " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Aborted by user"
+    exit 1
+fi
 
 # Check if pearld exists
 if [ ! -f "bin/pearld" ]; then
