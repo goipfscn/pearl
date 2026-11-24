@@ -937,24 +937,38 @@ void noisy_gemm(
   // SM120 (Blackwell CC 12.0) fallback detection
   bool use_sm120_fallback = (dprops->major >= 10);
 
-  // SM120 shared memory validation: main GEMM with certain tile/stage/R configs
-  // exceeds device limits on Blackwell. Filter unsupported combinations.
+  // SM120 shared memory validation: Use opt-in limit, not default
+  // sharedMemPerBlock reports default (49152), need sharedMemPerBlockOptin (101376)
   if (use_sm120_fallback) {
-    // Conservative estimate: reject tile configs that request >100KB shared memory
-    // Actual device limit on Blackwell RTX PRO 5000: ~101376 bytes per block
-    // High-R (128) with large tiles (128x128x64) and stages can exceed this
+    // Query opt-in SMEM limit for Blackwell
+    int device_id;
+    cudaGetDevice(&device_id);
+    
+    size_t device_smem_limit_optin = 0;
+    cudaError_t err = cudaDeviceGetAttribute(
+        reinterpret_cast<int*>(&device_smem_limit_optin),
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        device_id
+    );
+    
+    // Fall back to sharedMemPerBlock if opt-in query fails
+    size_t device_smem_limit = (err == cudaSuccess && device_smem_limit_optin > 0) 
+        ? device_smem_limit_optin 
+        : dprops->sharedMemPerBlock;
+    
+    // Conservative estimate (undercounts by ~2048 per user report, so add margin)
+    // Actual SharedStorage includes pipeline state, barriers, padding
     size_t estimated_smem_bytes = 
         (bM * bK + bN * bK) * sizeof(int8_t) * pipeline_stages +  // A/B tiles
-        (bM * bN) * sizeof(cutlass::bfloat16_t) +                 // C accumulator fragment
-        r * (bM + bN) * sizeof(int16_t);                          // denoise scratch
-
-    size_t device_smem_limit = dprops->sharedMemPerBlock;
+        (bM * bN) * sizeof(cutlass::bfloat16_t) +                 // C accumulator
+        r * (bM + bN) * sizeof(int16_t) +                         // denoise scratch
+        2048;                                                     // margin for overhead
     
     TORCH_CHECK(estimated_smem_bytes <= device_smem_limit,
                 "Requested tile configuration exceeds SM120 shared memory limit: ",
-                "estimated ", estimated_smem_bytes, " bytes, device limit ",
-                device_smem_limit, " bytes. Try smaller tile sizes (bM/bN/bK), ",
-                "fewer pipeline stages, or lower noise rank R.");
+                "estimated ", estimated_smem_bytes, " bytes, device opt-in limit ",
+                device_smem_limit, " bytes (default ", dprops->sharedMemPerBlock, 
+                "). Try smaller tile sizes (bM/bN/bK), fewer pipeline stages, or lower R.");
   }
 
   bool kernel_found_matmul = false;
@@ -967,14 +981,15 @@ void noisy_gemm(
   // Run SM120 fallback noising kernels if on Blackwell
   if (use_sm120_fallback) {
     if (run_noising_a) {
+      // noise_A expects: EAR_R_major (k, r), EBL_K_major (r, k)
       bool convert_AxEBL = (AxEBL_noising_dtype == torch::kFloat16);
       pearl::launch_noise_A_sm120(
           static_cast<const int8_t*>(A.data_ptr()),
           static_cast<const int8_t*>(EAL.data_ptr()),
           AxEBL_noising_dtype == torch::kFloat16 ? AxEBL_fp16.data_ptr() : AxEBL_int32.data_ptr(),
           static_cast<int8_t*>(ApEA.data_ptr()),
-          static_cast<const int8_t*>(EAR_K_major.data_ptr()),
-          static_cast<const int8_t*>(EBL_K_major.data_ptr()),
+          static_cast<const int8_t*>(EAR_R_major.data_ptr()),  // (k, r)
+          static_cast<const int8_t*>(EBL_K_major.data_ptr()),  // (r, k)
           m, k, r,
           convert_AxEBL,
           stream
@@ -986,14 +1001,15 @@ void noisy_gemm(
     }
 
     if (run_noising_b) {
+      // noise_B expects: EAR_K_major (r, k), EBL_R_major (k, r)
       bool convert_EARxBpEB = (EARxBpEB_noising_dtype == torch::kFloat16);
       pearl::launch_noise_B_sm120(
           static_cast<const int8_t*>(B.data_ptr()),
           static_cast<const int8_t*>(EBR.data_ptr()),
           EARxBpEB_noising_dtype == torch::kFloat16 ? EARxBpEB_fp16.data_ptr() : EARxBpEB_int32.data_ptr(),
           static_cast<int8_t*>(BpEB.data_ptr()),
-          static_cast<const int8_t*>(EAR_K_major.data_ptr()),
-          static_cast<const int8_t*>(EBL_K_major.data_ptr()),
+          static_cast<const int8_t*>(EAR_K_major.data_ptr()),  // (r, k)
+          static_cast<const int8_t*>(EBL_R_major.data_ptr()),  // (k, r)
           n, k, r,
           convert_EARxBpEB,
           stream
