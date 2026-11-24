@@ -27,6 +27,27 @@
 
 #include <iostream>
 
+// Forward declarations for SM120 fallback kernels
+namespace pearl {
+void launch_noise_A_sm120(
+    const int8_t* A, const int8_t* EAL,
+    void* AxEBL, int8_t* ApEA,
+    const int8_t* EAR_R_major, const int8_t* EBL_K_major,
+    int m, int k, int R,
+    bool convert_AxEBL,
+    cudaStream_t stream
+);
+
+void launch_noise_B_sm120(
+    const int8_t* B, const int8_t* EBR,
+    void* EARxBpEB, int8_t* BpEB,
+    const int8_t* EAR_K_major, const int8_t* EBL_R_major,
+    int n, int k, int R,
+    bool convert_EARxBpEB,
+    cudaStream_t stream
+);
+}
+
 namespace PYBIND11_NAMESPACE {
 namespace detail {
 
@@ -311,6 +332,9 @@ void noise_A(at::Tensor& A,                          // m x k
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
+  // Check device capability - use SM120 fallback for CC >= 10.0
+  bool use_sm120_fallback = (dprops->major >= 10);
+
   at::Tensor EAR, EBL;
 
   int m = int(A.size(0));
@@ -337,6 +361,25 @@ void noise_A(at::Tensor& A,                          // m x k
   check_tensor(EAL, m, r, torch::kInt8);
   check_tensor(ApEA, m, k, torch::kInt8);
   check_tensor(AxEBL, m, r, torch::kFloat16, torch::kInt32);
+
+  if (use_sm120_fallback) {
+    // SM120 (Blackwell CC 12.0) simple fallback - unbenchmarked baseline
+    bool convert_AxEBL = (AxEBL.scalar_type() == torch::kFloat16);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    
+    pearl::launch_noise_A_sm120(
+        static_cast<const int8_t*>(A.data_ptr()),
+        static_cast<const int8_t*>(EAL.data_ptr()),
+        AxEBL.data_ptr(),
+        static_cast<int8_t*>(ApEA.data_ptr()),
+        static_cast<const int8_t*>(EAR.data_ptr()),
+        static_cast<const int8_t*>(EBL.data_ptr()),
+        m, k, r,
+        convert_AxEBL,
+        stream
+    );
+    return;
+  }
 
   const int64_t tile_size_m = tile_size_m_.value_or(kDefaultNoisingTileSizeMN);
   const int64_t tile_size_k = tile_size_k_.value_or(kDefaultNoisingTileSizeK);
@@ -395,7 +438,11 @@ void noise_A(at::Tensor& A,                          // m x k
               "No noise_A kernel found with given config: ", "R = ", r,
               ", bM_noising = ", tile_size_m, ", AxEBL of type ",
               c10::toString(AxEBL.scalar_type()));
-}
+  return;
+  }  // end SM120 fallback branch
+  
+  // Original optimized path continues below (not reached if SM120)
+  {
 
 void noise_B(at::Tensor& B,                          // n x k
              at::Tensor& EBR,                        // n x r
@@ -437,6 +484,25 @@ void noise_B(at::Tensor& B,                          // n x k
   check_tensor(EBR, n, r, torch::kInt8);
   check_tensor(BpEB, n, k, torch::kInt8);
   check_tensor(EARxBpEB, n, r, torch::kFloat16, torch::kInt32);
+
+  if (use_sm120_fallback) {
+    // SM120 (Blackwell CC 12.0) simple fallback - unbenchmarked baseline
+    bool convert_EARxBpEB = (EARxBpEB.scalar_type() == torch::kFloat16);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    
+    pearl::launch_noise_B_sm120(
+        static_cast<const int8_t*>(B.data_ptr()),
+        static_cast<const int8_t*>(EBR.data_ptr()),
+        EARxBpEB.data_ptr(),
+        static_cast<int8_t*>(BpEB.data_ptr()),
+        static_cast<const int8_t*>(EAR.data_ptr()),
+        static_cast<const int8_t*>(EBL.data_ptr()),
+        n, k, r,
+        convert_EARxBpEB,
+        stream
+    );
+    return;
+  }
 
   const int64_t tile_size_n = tile_size_n_.value_or(kDefaultNoisingTileSizeMN);
   const int64_t tile_size_k = tile_size_k_.value_or(kDefaultNoisingTileSizeK);
