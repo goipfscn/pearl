@@ -364,6 +364,10 @@ void noise_A(at::Tensor& A,                          // m x k
 
   if (use_sm120_fallback) {
     // SM120 (Blackwell CC 12.0) simple fallback - unbenchmarked baseline
+    // Requires EAR and EBL to be present
+    TORCH_CHECK(EAR_.has_value() && EBL_.has_value(),
+                "SM120 fallback requires both EAR and EBL");
+    
     bool convert_AxEBL = (AxEBL.scalar_type() == torch::kFloat16);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     
@@ -378,6 +382,7 @@ void noise_A(at::Tensor& A,                          // m x k
         convert_AxEBL,
         stream
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
 
@@ -438,11 +443,7 @@ void noise_A(at::Tensor& A,                          // m x k
               "No noise_A kernel found with given config: ", "R = ", r,
               ", bM_noising = ", tile_size_m, ", AxEBL of type ",
               c10::toString(AxEBL.scalar_type()));
-  return;
-  }  // end SM120 fallback branch
-  
-  // Original optimized path continues below (not reached if SM120)
-  {
+}
 
 void noise_B(at::Tensor& B,                          // n x k
              at::Tensor& EBR,                        // n x r

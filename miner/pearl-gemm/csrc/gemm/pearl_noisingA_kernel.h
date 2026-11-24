@@ -721,6 +721,9 @@ class NoisingKernelA {
       // Convert down from int32 accumulator to int8
       pearl::convert_type_out(tCrApEA, tCrApEA_int8);
 
+      // Shuffle to allow for bank conflict free store and load
+      permute_Aregs_fp8(tCrApEA_int8);
+
       // Load A to registers
       pipeline_a.consumer_wait(smem_pipe_read_a);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -746,67 +749,15 @@ class NoisingKernelA {
       pipeline_a.consumer_release(smem_pipe_read_a);
       ++smem_pipe_read_a;
 
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
-      // SM90: Convert WGMMA accumulator layout to match ldmatrix copy layout
-      permute_Aregs_fp8(tCrApEA_int8);
-      
-      // Add A to EA in copy layout
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(taccCrA_int8); ++i) {
-        taccCrA_int8[i] += tCrApEA_int8[i];
-      }
-#else
-      // SM80: Explicit element-wise addition via SMEM
-      // Store tCrApEA back to SMEM, add with A in SMEM, reload for R2S
-      // Correctness first - avoid complex register layout aliasing issues
-      
+      // Add A to EA
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
       if (tid < 32) {
-        // Store EA (from MMA) to temporary SMEM location
-        // We'll reuse sApEA for this (it's not used until R2S below)
-        auto sApEA_pi_int8 = recast<Element>(sApEA);
-        auto sEA_tmp = sApEA_pi_int8(_, _, _, smem_pipe_write_apea.index());
-        
-        // Partition SMEM for this thread's MMA output
-        auto thr_mma_mkr = tiled_mma_mkr.get_slice(tid);
-        auto tCsEA = thr_mma_mkr.partition_C(sEA_tmp);
-        
-        // Copy MMA result to SMEM
-        cute::copy(tCrApEA_int8, tCsEA);
-      }
-      
-      // Sync so all threads see EA in SMEM
-      cutlass::arch::NamedBarrier::sync(
-          32, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
-      cutlass::arch::fence_view_async_shared();
-      
-      if (tid < 32) {
-        // Now add A + EA element-wise in SMEM using simple scalar addressing
-        // Both A and EA are in SMEM with same layout (SmemLayoutA)
-        auto sA_int8 = recast<Element>(sA_pi(_, _, _, smem_pipe_read_a.index()));
-        auto sEA_int8 = recast<Element>(sApEA(_, _, _, smem_pipe_write_apea.index()));
-        
-        // Each thread processes a stripe of the tile
-        // Simple strided access across 32 threads
-        constexpr int elems_per_tile = cosize(SmemLayoutA{});
-        for (int i = tid; i < elems_per_tile; i += 32) {
-          sEA_int8(i) = sA_int8(i) + sEA_int8(i);  // ApEA = A + EA
+#endif
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(taccCrA_int8); ++i) {
+          taccCrA_int8[i] += tCrApEA_int8[i];
         }
-        
-        // Result is now in sEA (which aliases sApEA for R2S below)
-        // Load to taccCrA for R2S
-        cute::copy(s2r_tiled_copy_A, taccCsA(_, _, _, smem_pipe_read_a.index()),
-                   taccCrA);  // This will be overwritten by reload below
-      }
-      
-      // Reload ApEA from SMEM to taccCrA for R2S
-      cutlass::arch::NamedBarrier::sync(
-          32, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
-      
-      if (tid < 32) {
-        // Load ApEA result from SMEM
-        auto sApEA_u16_result = recast<uint16_t>(sApEA(_, _, _, smem_pipe_write_apea.index()));
-        auto taccCsApEA_result = s2r_thr_copy_A.partition_S(sApEA_u16_result);
-        cute::copy(s2r_tiled_copy_A, taccCsApEA_result, taccCrA);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
       }
 #endif
 

@@ -207,10 +207,8 @@ void launch_noise_B_sm120(
         stride_B, stride_EBR, stride_EBL, stride_BpEB
     );
     
-    // Synchronize to ensure BpEB is ready
-    cudaStreamSynchronize(stream);
-    
     // Launch EARxBpEB kernel (depends on BpEB)
+    // No sync needed - kernels on same stream are ordered
     dim3 block_ear(16, 16);
     dim3 grid_ear((n + 15) / 16, (R + 15) / 16);
     compute_EARxBpEB_sm120<<<grid_ear, block_ear, 0, stream>>>(

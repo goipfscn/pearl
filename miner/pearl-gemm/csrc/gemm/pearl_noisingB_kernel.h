@@ -694,7 +694,7 @@ class NoisingKernelB {
                                      select<0, 1>(TileShape_NKR_half{}));
     auto tCrB_u16 = make_tensor_like<uint16_t>(tCrB);  // (MMA_V, MMA_M, MM_N)
     // ((ATOM_V, COPY_V), COPY_M, COPY_N)
-    auto taccCrB = s2r_tiled_copy_B.retile_D(tCrB_u16);
+    auto taccCrB = s2r_thr_copy_B.retile_D(tCrB_u16);
     auto taccCrB_int8 = recast<Element>(taccCrB);
 
     // R2S copy for B, because stsm and ldsm has the same shape, we don't
@@ -768,61 +768,18 @@ class NoisingKernelB {
       // Convert down from int32 accumulator to int8
       pearl::convert_type_out(tCrBpEB, tCrBpEB_int8);
 
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
-      // SM90: Convert WGMMA accumulator layout to match ldmatrix copy layout
+      // Shuffle to allow for bank conflict free store and load
       permute_Aregs_fp8(tCrBpEB_int8);
-      
-      // Add B to EB in copy layout
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(taccCrB_int8); ++i) {
-        taccCrB_int8[i] += tCrBpEB_int8[i];
-      }
-#else
-      // SM80: Explicit element-wise addition via SMEM
-      // Store tCrBpEB back to SMEM, add with B in SMEM, reload for R2S
-      
+
+      // Add B to EB
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
       if (tid < 32) {
-        // Store EB (from MMA) to temporary SMEM location
-        auto sBpEB_pi_int8 = recast<Element>(sBpEB);
-        auto sEB_tmp = sBpEB_pi_int8(_, _, _, smem_pipe_write_BpEB.index());
-        
-        // Partition SMEM for this thread's MMA output
-        auto thr_mma_nkr = tiled_mma_nkr.get_slice(tid);
-        auto tCsEB = thr_mma_nkr.partition_C(sEB_tmp);
-        
-        // Copy MMA result to SMEM
-        cute::copy(tCrBpEB_int8, tCsEB);
-      }
-      
-      // Sync so all threads see EB in SMEM
-      cutlass::arch::NamedBarrier::sync(
-          32, static_cast<uint32_t>(NamedBarriers::S2RCopyBDone));
-      cutlass::arch::fence_view_async_shared();
-      
-      if (tid < 32) {
-        // Add B + EB element-wise in SMEM
-        auto sB_int8 = recast<Element>(sB_pi(_, _, _, smem_pipe_read_B.index()));
-        auto sEB_int8 = recast<Element>(sBpEB(_, _, _, smem_pipe_write_BpEB.index()));
-        
-        // Simple strided access across 32 threads
-        constexpr int elems_per_tile = cosize(SmemLayoutB{});
-        for (int i = tid; i < elems_per_tile; i += 32) {
-          sEB_int8(i) = sB_int8(i) + sEB_int8(i);  // BpEB = B + EB
+#endif
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(taccCrB_int8); ++i) {
+          taccCrB_int8[i] += tCrBpEB_int8[i];
         }
-        
-        // Load to taccCrB for R2S
-        cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, smem_pipe_read_B.index()),
-                   taccCrB);
-      }
-      
-      // Reload BpEB from SMEM to taccCrB for R2S
-      cutlass::arch::NamedBarrier::sync(
-          32, static_cast<uint32_t>(NamedBarriers::S2RCopyBDone));
-      
-      if (tid < 32) {
-        auto sBpEB_u16_result = recast<uint16_t>(sBpEB(_, _, _, smem_pipe_write_BpEB.index()));
-        auto taccCsBpEB_result = s2r_thr_copy_B.partition_S(sBpEB_u16_result);
-        cute::copy(s2r_tiled_copy_B, taccCsBpEB_result, taccCrB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
       }
 #endif
 
