@@ -458,6 +458,10 @@ void noise_B(at::Tensor& B,                          // n x k
 
   at::cuda::CUDAGuard device_guard{(char)B.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
+  
+  // Check device capability - use SM120 fallback for CC >= 10.0
+  bool use_sm120_fallback = (dprops->major >= 10);
+  
   at::Tensor EAR, EBL;
 
   if (k_blocks_per_split_.has_value() && k_blocks_per_split_.value() > 0) {
