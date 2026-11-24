@@ -671,13 +671,9 @@ class NoisingKernelA {
     auto sA_u16 = recast<uint16_t>(sA_pi);
     auto taccCsA = s2r_thr_copy_A.partition_S(sA_u16);
 
-    // Create A fragment in MMA layout (same as tCrApEA from gemm())
     auto tCrA = partition_fragment_C(tiled_mma_half,
                                      select<0, 1>(TileShape_MKR_half{}));
-    auto tCrA_u16 = make_tensor_like<uint16_t>(tCrA);  // (MMA_V, MMA_M, MMA_N)
-    auto tCrA_int8 = recast<Element>(tCrA);  // Keep in MMA layout for addition
-    
-    // Also create copy-layout view for S2R and R2S operations
+    auto tCrA_u16 = make_tensor_like<uint16_t>(tCrA);  // (MMA_V, MMA_M, MM_N)
     // ((ATOM_V, COPY_V), COPY_M, COPY_N)
     auto taccCrA = s2r_thr_copy_A.retile_D(tCrA_u16);
     auto taccCrA_int8 = recast<Element>(taccCrA);
@@ -752,7 +748,6 @@ class NoisingKernelA {
 
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 1000)
       // SM90: Convert WGMMA accumulator layout to match ldmatrix copy layout
-      // After permutation, both tCrApEA_int8 and taccCrA_int8 are in ldmatrix layout
       permute_Aregs_fp8(tCrApEA_int8);
       
       // Add A to EA in copy layout
@@ -761,20 +756,57 @@ class NoisingKernelA {
         taccCrA_int8[i] += tCrApEA_int8[i];
       }
 #else
-      // SM80: Add in MMA layout directly
-      // tCrApEA_int8 is in raw SM80 MMA layout
-      // tCrA_int8 is ALSO in MMA layout (same as tCrApEA)
-      // Both are partition_fragment_C outputs, so layouts match
-      // taccCrA_int8 is retiled view of tCrA_int8 for copy operations
+      // SM80: Explicit element-wise addition via SMEM
+      // Store tCrApEA back to SMEM, add with A in SMEM, reload for R2S
+      // Correctness first - avoid complex register layout aliasing issues
       
       if (tid < 32) {
-        // Add in MMA layout where both fragments have matching coordinates
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tCrA_int8); ++i) {
-          tCrA_int8[i] += tCrApEA_int8[i];
+        // Store EA (from MMA) to temporary SMEM location
+        // We'll reuse sApEA for this (it's not used until R2S below)
+        auto sApEA_pi_int8 = recast<Element>(sApEA);
+        auto sEA_tmp = sApEA_pi_int8(_, _, _, smem_pipe_write_apea.index());
+        
+        // Partition SMEM for this thread's MMA output
+        auto thr_mma_mkr = tiled_mma_mkr.get_slice(tid);
+        auto tCsEA = thr_mma_mkr.partition_C(sEA_tmp);
+        
+        // Copy MMA result to SMEM
+        cute::copy(tCrApEA_int8, tCsEA);
+      }
+      
+      // Sync so all threads see EA in SMEM
+      cutlass::arch::NamedBarrier::sync(
+          32, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
+      cutlass::arch::fence_view_async_shared();
+      
+      if (tid < 32) {
+        // Now add A + EA element-wise in SMEM using simple scalar addressing
+        // Both A and EA are in SMEM with same layout (SmemLayoutA)
+        auto sA_int8 = recast<Element>(sA_pi(_, _, _, smem_pipe_read_a.index()));
+        auto sEA_int8 = recast<Element>(sApEA(_, _, _, smem_pipe_write_apea.index()));
+        
+        // Each thread processes a stripe of the tile
+        // Simple strided access across 32 threads
+        constexpr int elems_per_tile = cosize(SmemLayoutA{});
+        for (int i = tid; i < elems_per_tile; i += 32) {
+          sEA_int8(i) = sA_int8(i) + sEA_int8(i);  // ApEA = A + EA
         }
-        // Result is now in tCrA_int8 (MMA layout)
-        // taccCrA_int8 is a retiled view of the same registers, so it sees the update
+        
+        // Result is now in sEA (which aliases sApEA for R2S below)
+        // Load to taccCrA for R2S
+        cute::copy(s2r_tiled_copy_A, taccCsA(_, _, _, smem_pipe_read_a.index()),
+                   taccCrA);  // This will be overwritten by reload below
+      }
+      
+      // Reload ApEA from SMEM to taccCrA for R2S
+      cutlass::arch::NamedBarrier::sync(
+          32, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
+      
+      if (tid < 32) {
+        // Load ApEA result from SMEM
+        auto sApEA_u16_result = recast<uint16_t>(sApEA(_, _, _, smem_pipe_write_apea.index()));
+        auto taccCsApEA_result = s2r_thr_copy_A.partition_S(sApEA_u16_result);
+        cute::copy(s2r_tiled_copy_A, taccCsApEA_result, taccCrA);
       }
 #endif
 
