@@ -19,5 +19,6 @@ enum class NamedBarriers {
   DenoiseConvertEAxBpEBWrite = 8,
   Epilogue = 9,
   LoadScales = 10,
+  DenoisePhase1Consumed = 11,  // sm_120: synchronize SMEM aliasing between denoise phases
 };
 }

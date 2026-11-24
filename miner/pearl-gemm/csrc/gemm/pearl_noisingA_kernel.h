@@ -106,9 +106,9 @@ class NoisingKernelA {
   layout is handled by swizzles in the SMEM layouts.
   */
   using TiledMmaMRK = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_MRK>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockM>, cute::Underscore, cute::Underscore>{}));
 
   /*
   Tiled WGMMA for A + EAL * EAR, size (bM, bK, R) for one k_block iteration.
@@ -118,9 +118,9 @@ class NoisingKernelA {
   The operands are both sourced from SMEM, but accumulator is in RMEM.
   */
   using TiledMmaMKR = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_MKR>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockM>, cute::Underscore, cute::Underscore>{}));
 
   /*
   Smem layouts for the smem tensors, used primarily for TMA and WGMMA. Sizes are
@@ -239,11 +239,16 @@ class NoisingKernelA {
   // accumulator.
   using TileShape_MKR_half = Shape<Int<kBlockM>, Int<kBlockK / 2>, Int<R>>;
   using TiledMmaMKR_half = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_MKR_half>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockM>, cute::Underscore, cute::Underscore>{}));
   using S2RCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
+  // R2S: SM90 STSM on Hopper, AutoVectorizing on Blackwell consumer / SM80 fallback
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  using R2SCopyAtomA = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, uint16_t>;
+#else
   using R2SCopyAtomA = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
+#endif
 
   // Defining load pipeline types (initialized in kernel). Used by A, EBL and EAR
   using MainloopLoadPipeline = typename cutlass::PipelineTmaAsync<kStages>;
@@ -535,9 +540,23 @@ class NoisingKernelA {
     Tensor tCsA = thr_mma.partition_A(sA);      // (MMA,MMA_M,MMA_K,P)
     Tensor tCsEBL = thr_mma.partition_B(sEBL);  // (MMA,MMA_N,MMA_K,P)
 
-    // Allocate "fragments" -- these are WGMMA matrix descriptors
+    // Allocate fragments
     Tensor tCrA = thr_mma.make_fragment_A(tCsA);      // (MMA,MMA_M,MMA_K,P)
     Tensor tCrEBL = thr_mma.make_fragment_B(tCsEBL);  // (MMA,MMA_N,MMA_K,P)
+
+    // SM80 staging setup (declared unconditionally for compilation, used conditionally)
+    Tensor tCrAi = make_fragment_like<Element>(tCrA);
+    Tensor tCrEBLi = make_fragment_like<Element>(tCrEBL);
+    using S2RCopyAtom_A = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using S2RCopyAtom_B = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    auto s2r_tiled_copy_A = make_tiled_copy_A(S2RCopyAtom_A{}, thr_mma);
+    auto s2r_tiled_copy_B = make_tiled_copy_B(S2RCopyAtom_B{}, thr_mma);
+    auto s2r_thr_copy_A = s2r_tiled_copy_A.get_thread_slice(tid);
+    auto s2r_thr_copy_B = s2r_tiled_copy_B.get_thread_slice(tid);
+    Tensor tCsA_s2r = s2r_thr_copy_A.partition_S(sA);
+    Tensor tCsEBL_s2r = s2r_thr_copy_B.partition_S(sEBL);
+    Tensor tCrAi_view = s2r_thr_copy_A.retile_D(tCrAi);
+    Tensor tCrEBLi_view = s2r_thr_copy_B.retile_D(tCrEBLi);
 
     LoadPipelineState smem_pipe_read_a;
     LoadPipelineState smem_pipe_read_ebl;
@@ -547,16 +566,31 @@ class NoisingKernelA {
       pipeline_a.consumer_wait(smem_pipe_read_a);
       pipeline_ebl.consumer_wait(smem_pipe_read_ebl);
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrAxEBL);
       warpgroup_arrive();
-      // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto a_idx = smem_pipe_read_a.index();
+        auto ebl_idx = smem_pipe_read_ebl.index();
+        cute::copy(s2r_tiled_copy_A, tCsA_s2r(_, _, _, a_idx), tCrAi_view(_, _, _, a_idx));
+        cute::copy(s2r_tiled_copy_B, tCsEBL_s2r(_, _, _, ebl_idx), tCrEBLi_view(_, _, _, ebl_idx));
+        cute::transform(tCrAi(_, _, _, a_idx), tCrA(_, _, _, a_idx), cute::identity{});
+        cute::transform(tCrEBLi(_, _, _, ebl_idx), tCrEBL(_, _, _, ebl_idx), cute::identity{});
+      }
+#endif
+      // MMA: int8 × int8 → int32
       gemm(tiled_mma, tCrA(_, _, _, smem_pipe_read_a.index()),
            tCrEBL(_, _, _, smem_pipe_read_ebl.index()), tCrAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       // Wait for all MMAs across the warp group to complete
       warpgroup_wait<0>();
 
       warpgroup_fence_operand(tCrAxEBL);
+#endif
 
       cutlass::arch::fence_view_async_shared();
       pipeline_a.consumer_release(smem_pipe_read_a);
@@ -612,6 +646,20 @@ class NoisingKernelA {
     // (1, REST_K, REST_R) -- tensor of WGMMA descriptors, 1 per atom
     Tensor tCrEAR = thr_mma.make_fragment_B(tCsEAR);
 
+    // SM80 staging setup for EAL×EAR GEMM
+    Tensor tCrEALi = make_fragment_like<Element>(tCrEAL);
+    Tensor tCrEARi = make_fragment_like<Element>(tCrEAR);
+    using S2RCopyAtomEAL_A = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using S2RCopyAtomEAL_B = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    auto s2r_tiled_copy_EAL_A = make_tiled_copy_A(S2RCopyAtomEAL_A{}, thr_mma);
+    auto s2r_tiled_copy_EAL_B = make_tiled_copy_B(S2RCopyAtomEAL_B{}, thr_mma);
+    auto s2r_thr_copy_EAL_A = s2r_tiled_copy_EAL_A.get_thread_slice(tid);
+    auto s2r_thr_copy_EAL_B = s2r_tiled_copy_EAL_B.get_thread_slice(tid);
+    Tensor tCsEAL_s2r = s2r_thr_copy_EAL_A.partition_S(sEAL);
+    Tensor tCsEAR_s2r = s2r_thr_copy_EAL_B.partition_S(sEAR);
+    Tensor tCrEALi_view = s2r_thr_copy_EAL_A.retile_D(tCrEALi);
+    Tensor tCrEARi_view = s2r_thr_copy_EAL_B.retile_D(tCrEARi);
+
     // Wait for EAL load. It does not change with K, so only once
     uint64_t* eal_mbar = &shared_storage.eal_mbar;
     ProducerBarType::wait(eal_mbar, 0);
@@ -644,16 +692,30 @@ class NoisingKernelA {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (int k_block = k_block_min; k_block < k_block_max; ++k_block) {
-      // WGMMA: A + EAL * EAR
+      // MMA: EAL × EAR → ApEA
       clear(tCrApEA);  // We store every iter so we need to clear
       pipeline_ear.consumer_wait(smem_pipe_read_ear);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrApEA);
       warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto ear_idx = smem_pipe_read_ear.index();
+        cute::copy(s2r_tiled_copy_EAL_A, tCsEAL_s2r, tCrEALi_view);
+        cute::copy(s2r_tiled_copy_EAL_B, tCsEAR_s2r(_, _, _, ear_idx), tCrEARi_view(_, _, _, ear_idx));
+        cute::transform(tCrEALi, tCrEAL, cute::identity{});
+        cute::transform(tCrEARi(_, _, _, ear_idx), tCrEAR(_, _, _, ear_idx), cute::identity{});
+      }
+#endif
       gemm(tiled_mma, tCrEAL, tCrEAR(_, _, _, smem_pipe_read_ear.index()),
            tCrApEA);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       warpgroup_wait<0>();
       warpgroup_fence_operand(tCrApEA);
+#endif
       pipeline_ear.consumer_release(smem_pipe_read_ear);
       ++smem_pipe_read_ear;
       // Convert down from int32 accumulator to int8
@@ -664,24 +726,53 @@ class NoisingKernelA {
 
       // Load A to registers
       pipeline_a.consumer_wait(smem_pipe_read_a);
-      cute::copy(s2r_tiled_copy_A, taccCsA(_, _, _, smem_pipe_read_a.index()),
-                 taccCrA);
-      cutlass::arch::NamedBarrier::sync(
-          kNumApEAThreads, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
-      cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Only 32 threads (tid 0-31) participate in MMA and have valid data.
+      // Threads 32-127 must skip S2R, addition, sync, and R2S.
+      if (tid < 32) {
+#endif
+        cute::copy(s2r_tiled_copy_A, taccCsA(_, _, _, smem_pipe_read_a.index()),
+                   taccCrA);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        // SM80: Only participating threads sync
+        cutlass::arch::NamedBarrier::sync(
+            32, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
+#else
+        // SM90: All warpgroup threads sync
+        cutlass::arch::NamedBarrier::sync(
+            kNumApEAThreads, static_cast<uint32_t>(NamedBarriers::S2RCopyADone));
+#endif
+        cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
       pipeline_a.consumer_release(smem_pipe_read_a);
       ++smem_pipe_read_a;
 
       // Add A to EA
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(taccCrA_int8); ++i) {
-        taccCrA_int8[i] += tCrApEA_int8[i];
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {
+#endif
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(taccCrA_int8); ++i) {
+          taccCrA_int8[i] += tCrApEA_int8[i];
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
       }
+#endif
 
       // RMEM->SMEM copy for ApEA to "stage" it for TMA_STORE
       pipeline_apea.producer_acquire(smem_pipe_write_apea);
-      cute::copy(r2s_tiled_copy_A, taccCrA,
-                 taccCsApEA(_, _, _, smem_pipe_write_apea.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Only 32 threads (1 warp) participate in m16n8k32 MMA.
+      // Threads 32-127 have uninitialized taccCrA and must not write to SMEM.
+      if (tid < 32) {
+#endif
+        cute::copy(r2s_tiled_copy_A, taccCrA,
+                   taccCsApEA(_, _, _, smem_pipe_write_apea.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
       cutlass::arch::fence_view_async_shared();
       pipeline_apea.producer_commit(smem_pipe_write_apea);
       ++smem_pipe_write_apea;
@@ -724,11 +815,23 @@ class NoisingKernelA {
       }
       Tensor tR2SrAxEBL = r2s_thr_copy_O.retile_S(
           tCrAxEBL_out);  // ((Atom,AtomNum), MMA_M, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     } else {
       Tensor tR2SrAxEBL =
           r2s_thr_copy_O.retile_S(tCrAxEBL);  // ((Atom,AtomNum), MMA_M, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrAxEBL, tR2SsAxEBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     }
 
     // ensure smem writes are completed and visible to TMA

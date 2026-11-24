@@ -98,19 +98,18 @@ class NoisingKernelB {
   using AtomLayoutMma = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
 
   /*
-  Tiled WGMMA for EAR * BpEB, int8 * int8 -> int32, size (bN, R, bK) for one k_block.
-  The op selector will select the appropriate GMEM Atom; it will try to fill 0-mode
-  and 1-mode, and tile along 2-mode (which must be 32). So we will get bNxRx32 atom.
-  The only supported atom size in the n-mode is 64, so bN%64==0. The warpspecialized
-  kernel assigns warpgroup 1 to handle EAR * BpEB, and because we only use one WG the
-  atom layout is trivial. Each WGMMA consumes one BpEB tile (bN,bK) and one EAR tile (R,bK).
+  Tiled MMA for EAR * BpEB, int8 * int8 -> int32, size (bN, R, bK) for one k_block.
+  SM90: WGMMA with ss_op_selector for bNxRx32 atom.
+  SM80: m16n8k32 MMA atom (Blackwell consumer fallback).
+  The warpspecialized kernel assigns warpgroup 1 to handle EAR * BpEB.
+  Each MMA consumes one BpEB tile (bN,bK) and one EAR tile (R,bK).
   The operands are both sourced from SMEM and must have a specific layout; this
   layout is handled by swizzles in the SMEM layouts.
   */
   using TiledMmaNRK = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NRK>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockN>, cute::Underscore, cute::Underscore>{}));
 
   /*
   Tiled WGMMA for B + EBR * EBL, size (bN, bK, R) for one k_block iteration.
@@ -120,9 +119,9 @@ class NoisingKernelB {
   The operands are both sourced from SMEM, but accumulator is in RMEM.
   */
   using TiledMmaNKR = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NKR>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockN>, cute::Underscore, cute::Underscore>{}));
 
   /*
   Smem layouts for the smem tensors, used primarily for TMA and WGMMA. Sizes are
@@ -251,11 +250,16 @@ class NoisingKernelB {
   // accumulator.
   using TileShape_NKR_half = Shape<Int<kBlockN>, Int<kBlockK / 2>, Int<R>>;
   using TiledMmaNKR_half = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NKR_half>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Int<kBlockN>, cute::Underscore, cute::Underscore>{}));
   using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
+  // R2S: SM90 STSM on Hopper, AutoVectorizing on Blackwell consumer / SM80 fallback
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  using R2SCopyAtomB = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, uint16_t>;
+#else
   using R2SCopyAtomB = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
+#endif
 
   // Defining load pipeline types (initialized in kernel). Used by B, EAR and EBL
   using MainloopLoadPipeline = typename cutlass::PipelineTmaAsync<kStages>;
@@ -555,9 +559,23 @@ class NoisingKernelB {
     Tensor tCsBpEB = thr_mma.partition_A(sBpEB);  // (MMA,MMA_N,MMA_K,P)
     Tensor tCsEAR = thr_mma.partition_B(sEAR);    // (MMA,MMA_N,MMA_K,P)
 
-    // Allocate "fragments" -- these are WGMMA matrix descriptors
+    // Allocate fragments
     Tensor tCrBpEB = thr_mma.make_fragment_A(tCsBpEB);  // (MMA,MMA_N,MMA_K,P)
     Tensor tCrEAR = thr_mma.make_fragment_B(tCsEAR);    // (MMA,MMA_N,MMA_K,P)
+
+    // SM80 staging setup
+    Tensor tCrBpEBi = make_fragment_like<Element>(tCrBpEB);
+    Tensor tCrEARi = make_fragment_like<Element>(tCrEAR);
+    using S2RCopyAtom_A = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using S2RCopyAtom_B = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    auto s2r_tiled_copy_A = make_tiled_copy_A(S2RCopyAtom_A{}, thr_mma);
+    auto s2r_tiled_copy_B = make_tiled_copy_B(S2RCopyAtom_B{}, thr_mma);
+    auto s2r_thr_copy_A = s2r_tiled_copy_A.get_thread_slice(tid);
+    auto s2r_thr_copy_B = s2r_tiled_copy_B.get_thread_slice(tid);
+    Tensor tCsBpEB_s2r = s2r_thr_copy_A.partition_S(sBpEB);
+    Tensor tCsEAR_s2r = s2r_thr_copy_B.partition_S(sEAR);
+    Tensor tCrBpEBi_view = s2r_thr_copy_A.retile_D(tCrBpEBi);
+    Tensor tCrEARi_view = s2r_thr_copy_B.retile_D(tCrEARi);
 
     StorePipelineState smem_pipe_read_BpEB;
     LoadPipelineState smem_pipe_read_EAR;
@@ -567,16 +585,31 @@ class NoisingKernelB {
       pipeline_BpEB.consumer_wait(smem_pipe_read_BpEB);
       pipeline_EAR.consumer_wait(smem_pipe_read_EAR);
       cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrEARxBpEB);
       warpgroup_arrive();
-      // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto bpeb_idx = smem_pipe_read_BpEB.index();
+        auto ear_idx = smem_pipe_read_EAR.index();
+        cute::copy(s2r_tiled_copy_A, tCsBpEB_s2r(_, _, _, bpeb_idx), tCrBpEBi_view(_, _, _, bpeb_idx));
+        cute::copy(s2r_tiled_copy_B, tCsEAR_s2r(_, _, _, ear_idx), tCrEARi_view(_, _, _, ear_idx));
+        cute::transform(tCrBpEBi(_, _, _, bpeb_idx), tCrBpEB(_, _, _, bpeb_idx), cute::identity{});
+        cute::transform(tCrEARi(_, _, _, ear_idx), tCrEAR(_, _, _, ear_idx), cute::identity{});
+      }
+#endif
+      // MMA: BpEB × EAR → EARxBpEB
       gemm(tiled_mma, tCrBpEB(_, _, _, smem_pipe_read_BpEB.index()),
            tCrEAR(_, _, _, smem_pipe_read_EAR.index()), tCrEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       // Wait for all MMAs across warp group to complete
       warpgroup_wait<0>();
 
       warpgroup_fence_operand(tCrEARxBpEB);
+#endif
 
       cutlass::arch::fence_view_async_shared();
       pipeline_BpEB.consumer_release(smem_pipe_read_BpEB);
@@ -632,6 +665,20 @@ class NoisingKernelB {
     // (1, REST_K, REST_R) -- tensor of WGMMA descriptors, 1 per atom
     Tensor tCrEBL = thr_mma.make_fragment_B(tCsEBL);
 
+    // SM80 staging setup for EBR×EBL GEMM
+    Tensor tCrEBRi = make_fragment_like<Element>(tCrEBR);
+    Tensor tCrEBLi = make_fragment_like<Element>(tCrEBL);
+    using S2RCopyAtomEBR_A = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using S2RCopyAtomEBR_B = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    auto s2r_tiled_copy_EBR_A = make_tiled_copy_A(S2RCopyAtomEBR_A{}, thr_mma);
+    auto s2r_tiled_copy_EBR_B = make_tiled_copy_B(S2RCopyAtomEBR_B{}, thr_mma);
+    auto s2r_thr_copy_EBR_A = s2r_tiled_copy_EBR_A.get_thread_slice(tid);
+    auto s2r_thr_copy_EBR_B = s2r_tiled_copy_EBR_B.get_thread_slice(tid);
+    Tensor tCsEBR_s2r = s2r_thr_copy_EBR_A.partition_S(sEBR);
+    Tensor tCsEBL_s2r = s2r_thr_copy_EBR_B.partition_S(sEBL);
+    Tensor tCrEBRi_view = s2r_thr_copy_EBR_A.retile_D(tCrEBRi);
+    Tensor tCrEBLi_view = s2r_thr_copy_EBR_B.retile_D(tCrEBLi);
+
     // Wait for EBR load. It does not change with K, so only once
     uint64_t* EBR_mbar = &shared_storage.EBR_mbar;
     ProducerBarType::wait(EBR_mbar, 0);
@@ -666,26 +713,55 @@ class NoisingKernelB {
     for (int k_block = k_block_min; k_block < k_block_max; ++k_block) {
 
       clear(tCrBpEB);  // We store every iter so we need to clear
-      // WGMMA: B + EBR * EBL
+      // MMA: EBR × EBL → BpEB
       pipeline_EBL.consumer_wait(smem_pipe_read_EBL);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrBpEB);
       warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Stage operands SMEM → register. Only 32 threads participate.
+      if (tid < 32) {
+        auto ebl_idx = smem_pipe_read_EBL.index();
+        cute::copy(s2r_tiled_copy_EBR_A, tCsEBR_s2r, tCrEBRi_view);
+        cute::copy(s2r_tiled_copy_EBR_B, tCsEBL_s2r(_, _, _, ebl_idx), tCrEBLi_view(_, _, _, ebl_idx));
+        cute::transform(tCrEBRi, tCrEBR, cute::identity{});
+        cute::transform(tCrEBLi(_, _, _, ebl_idx), tCrEBL(_, _, _, ebl_idx), cute::identity{});
+      }
+#endif
       gemm(tiled_mma, tCrEBR, tCrEBL(_, _, _, smem_pipe_read_EBL.index()),
            tCrBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       warpgroup_wait<0>();
       warpgroup_fence_operand(tCrBpEB);
+#endif
 
       pipeline_EBL.consumer_release(smem_pipe_read_EBL);
       ++smem_pipe_read_EBL;
 
       // Load B to registers
       pipeline_B.consumer_wait(smem_pipe_read_B);
-      cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, smem_pipe_read_B.index()),
-                 taccCrB);
-      cutlass::arch::NamedBarrier::sync(
-          kNumBpEBThreads, static_cast<uint32_t>(NamedBarriers::S2RCopyBDone));
-      cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: Only 32 threads (tid 0-31) participate in MMA and have valid data.
+      // Threads 32-127 must skip S2R, addition, sync, and R2S.
+      if (tid < 32) {
+#endif
+        cute::copy(s2r_tiled_copy_B, taccCsB(_, _, _, smem_pipe_read_B.index()),
+                   taccCrB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        // SM80: Only participating threads sync
+        cutlass::arch::NamedBarrier::sync(
+            32, static_cast<uint32_t>(NamedBarriers::S2RCopyBDone));
+#else
+        // SM90: All warpgroup threads sync
+        cutlass::arch::NamedBarrier::sync(
+            kNumBpEBThreads, static_cast<uint32_t>(NamedBarriers::S2RCopyBDone));
+#endif
+        cutlass::arch::fence_view_async_shared();
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
       pipeline_B.consumer_release(smem_pipe_read_B);
       ++smem_pipe_read_B;
 
@@ -696,15 +772,27 @@ class NoisingKernelB {
       permute_Aregs_fp8(tCrBpEB_int8);
 
       // Add B to EB
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(taccCrB_int8); ++i) {
-        taccCrB_int8[i] += tCrBpEB_int8[i];
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {
+#endif
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(taccCrB_int8); ++i) {
+          taccCrB_int8[i] += tCrBpEB_int8[i];
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
       }
+#endif
 
       // RMEM->SMEM copy for BpEB to "stage" it for TMA_STORE
       pipeline_BpEB.producer_acquire(smem_pipe_write_BpEB);
-      cute::copy(r2s_tiled_copy_B, taccCrB,
-                 taccCsBpEB(_, _, _, smem_pipe_write_BpEB.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_B, taccCrB,
+                   taccCsBpEB(_, _, _, smem_pipe_write_BpEB.index()));
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
       pipeline_BpEB.producer_commit(smem_pipe_write_BpEB);
       ++smem_pipe_write_BpEB;
     }
@@ -751,11 +839,23 @@ class NoisingKernelB {
       }
       Tensor tR2SrEARxBpEB = r2s_thr_copy_O.retile_S(
           tCrEARxBpEB_out);  // ((Atom,AtomNum), MMA_N, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     } else {
       Tensor tR2SrEARxBpEB = r2s_thr_copy_O.retile_S(
           tCrEARxBpEB);  // ((Atom,AtomNum), MMA_N, MMA_R)
-      cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      if (tid < 32) {  // SM80: Only MMA-participating threads
+#endif
+        cute::copy(r2s_tiled_copy_O, tR2SrEARxBpEB, tR2SsEARxBpEB);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      }
+#endif
     }
 
     // ensure smem writes are completed and visible to TMA

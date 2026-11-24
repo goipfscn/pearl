@@ -27,6 +27,27 @@
 
 #include <iostream>
 
+// Forward declarations for SM120 fallback kernels
+namespace pearl {
+void launch_noise_A_sm120(
+    const int8_t* A, const int8_t* EAL,
+    void* AxEBL, int8_t* ApEA,
+    const int8_t* EAR_R_major, const int8_t* EBL_K_major,
+    int m, int k, int R,
+    bool convert_AxEBL,
+    cudaStream_t stream
+);
+
+void launch_noise_B_sm120(
+    const int8_t* B, const int8_t* EBR,
+    void* EARxBpEB, int8_t* BpEB,
+    const int8_t* EAR_K_major, const int8_t* EBL_R_major,
+    int n, int k, int R,
+    bool convert_EARxBpEB,
+    cudaStream_t stream
+);
+}
+
 namespace PYBIND11_NAMESPACE {
 namespace detail {
 
@@ -311,6 +332,9 @@ void noise_A(at::Tensor& A,                          // m x k
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
+  // Check device capability - use SM120 fallback for CC >= 10.0
+  bool use_sm120_fallback = (dprops->major >= 10);
+
   at::Tensor EAR, EBL;
 
   int m = int(A.size(0));
@@ -337,6 +361,30 @@ void noise_A(at::Tensor& A,                          // m x k
   check_tensor(EAL, m, r, torch::kInt8);
   check_tensor(ApEA, m, k, torch::kInt8);
   check_tensor(AxEBL, m, r, torch::kFloat16, torch::kInt32);
+
+  if (use_sm120_fallback) {
+    // SM120 (Blackwell CC 12.0) simple fallback - unbenchmarked baseline
+    // Requires EAR and EBL to be present
+    TORCH_CHECK(EAR_.has_value() && EBL_.has_value(),
+                "SM120 fallback requires both EAR and EBL");
+    
+    bool convert_AxEBL = (AxEBL.scalar_type() == torch::kFloat16);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    
+    pearl::launch_noise_A_sm120(
+        static_cast<const int8_t*>(A.data_ptr()),
+        static_cast<const int8_t*>(EAL.data_ptr()),
+        AxEBL.data_ptr(),
+        static_cast<int8_t*>(ApEA.data_ptr()),
+        static_cast<const int8_t*>(EAR.data_ptr()),
+        static_cast<const int8_t*>(EBL.data_ptr()),
+        m, k, r,
+        convert_AxEBL,
+        stream
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
 
   const int64_t tile_size_m = tile_size_m_.value_or(kDefaultNoisingTileSizeMN);
   const int64_t tile_size_k = tile_size_k_.value_or(kDefaultNoisingTileSizeK);
@@ -410,6 +458,10 @@ void noise_B(at::Tensor& B,                          // n x k
 
   at::cuda::CUDAGuard device_guard{(char)B.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
+  
+  // Check device capability - use SM120 fallback for CC >= 10.0
+  bool use_sm120_fallback = (dprops->major >= 10);
+  
   at::Tensor EAR, EBL;
 
   if (k_blocks_per_split_.has_value() && k_blocks_per_split_.value() > 0) {
@@ -437,6 +489,26 @@ void noise_B(at::Tensor& B,                          // n x k
   check_tensor(EBR, n, r, torch::kInt8);
   check_tensor(BpEB, n, k, torch::kInt8);
   check_tensor(EARxBpEB, n, r, torch::kFloat16, torch::kInt32);
+
+  if (use_sm120_fallback) {
+    // SM120 (Blackwell CC 12.0) simple fallback - unbenchmarked baseline
+    bool convert_EARxBpEB = (EARxBpEB.scalar_type() == torch::kFloat16);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    
+    pearl::launch_noise_B_sm120(
+        static_cast<const int8_t*>(B.data_ptr()),
+        static_cast<const int8_t*>(EBR.data_ptr()),
+        EARxBpEB.data_ptr(),
+        static_cast<int8_t*>(BpEB.data_ptr()),
+        static_cast<const int8_t*>(EAR.data_ptr()),
+        static_cast<const int8_t*>(EBL.data_ptr()),
+        n, k, r,
+        convert_EARxBpEB,
+        stream
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
 
   const int64_t tile_size_n = tile_size_n_.value_or(kDefaultNoisingTileSizeMN);
   const int64_t tile_size_k = tile_size_k_.value_or(kDefaultNoisingTileSizeK);
@@ -862,12 +934,92 @@ void noisy_gemm(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+  // SM120 (Blackwell CC 12.0) fallback detection
+  bool use_sm120_fallback = (dprops->major >= 10);
+
+  // SM120 shared memory validation: Use opt-in limit, not default
+  // sharedMemPerBlock reports default (49152), need sharedMemPerBlockOptin (101376)
+  if (use_sm120_fallback) {
+    // Query opt-in SMEM limit for Blackwell
+    int device_id;
+    cudaGetDevice(&device_id);
+    
+    size_t device_smem_limit_optin = 0;
+    cudaError_t err = cudaDeviceGetAttribute(
+        reinterpret_cast<int*>(&device_smem_limit_optin),
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        device_id
+    );
+    
+    // Fall back to sharedMemPerBlock if opt-in query fails
+    size_t device_smem_limit = (err == cudaSuccess && device_smem_limit_optin > 0) 
+        ? device_smem_limit_optin 
+        : dprops->sharedMemPerBlock;
+    
+    // Conservative estimate (undercounts by ~2048 per user report, so add margin)
+    // Actual SharedStorage includes pipeline state, barriers, padding
+    size_t estimated_smem_bytes = 
+        (bM * bK + bN * bK) * sizeof(int8_t) * pipeline_stages +  // A/B tiles
+        (bM * bN) * sizeof(cutlass::bfloat16_t) +                 // C accumulator
+        r * (bM + bN) * sizeof(int16_t) +                         // denoise scratch
+        2048;                                                     // margin for overhead
+    
+    TORCH_CHECK(estimated_smem_bytes <= device_smem_limit,
+                "Requested tile configuration exceeds SM120 shared memory limit: ",
+                "estimated ", estimated_smem_bytes, " bytes, device opt-in limit ",
+                device_smem_limit, " bytes (default ", dprops->sharedMemPerBlock, 
+                "). Try smaller tile sizes (bM/bN/bK), fewer pipeline stages, or lower R.");
+  }
+
   bool kernel_found_matmul = false;
   bool kernel_found_noising_a = false;
   bool kernel_found_noising_b = false;
 
   bool do_denoise_conversion =
       (int32_noising_EARxBpEB || int32_noising_AxEBL) && (!skip_denoising);
+
+  // Run SM120 fallback noising kernels if on Blackwell
+  if (use_sm120_fallback) {
+    if (run_noising_a) {
+      // noise_A expects: EAR_R_major (k, r), EBL_K_major (r, k)
+      bool convert_AxEBL = (AxEBL_noising_dtype == torch::kFloat16);
+      pearl::launch_noise_A_sm120(
+          static_cast<const int8_t*>(A.data_ptr()),
+          static_cast<const int8_t*>(EAL.data_ptr()),
+          AxEBL_noising_dtype == torch::kFloat16 ? AxEBL_fp16.data_ptr() : AxEBL_int32.data_ptr(),
+          static_cast<int8_t*>(ApEA.data_ptr()),
+          static_cast<const int8_t*>(EAR_R_major.data_ptr()),  // (k, r)
+          static_cast<const int8_t*>(EBL_K_major.data_ptr()),  // (r, k)
+          m, k, r,
+          convert_AxEBL,
+          stream
+      );
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      kernel_found_noising_a = true;
+    } else {
+      kernel_found_noising_a = true;
+    }
+
+    if (run_noising_b) {
+      // noise_B expects: EAR_K_major (r, k), EBL_R_major (k, r)
+      bool convert_EARxBpEB = (EARxBpEB_noising_dtype == torch::kFloat16);
+      pearl::launch_noise_B_sm120(
+          static_cast<const int8_t*>(B.data_ptr()),
+          static_cast<const int8_t*>(EBR.data_ptr()),
+          EARxBpEB_noising_dtype == torch::kFloat16 ? EARxBpEB_fp16.data_ptr() : EARxBpEB_int32.data_ptr(),
+          static_cast<int8_t*>(BpEB.data_ptr()),
+          static_cast<const int8_t*>(EAR_K_major.data_ptr()),  // (r, k)
+          static_cast<const int8_t*>(EBL_R_major.data_ptr()),  // (k, r)
+          n, k, r,
+          convert_EARxBpEB,
+          stream
+      );
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      kernel_found_noising_b = true;
+    } else {
+      kernel_found_noising_b = true;
+    }
+  }
 
   DEBUG_MODE_SWITCH(
       enable_debug, EnableDebug,
@@ -876,23 +1028,23 @@ void noisy_gemm(
           SKIP_DENOISING_SWITCH(
               skip_denoising, SkipDenoising,
 
-              if (run_noising_a) {
+              if (!use_sm120_fallback && run_noising_a) {
                 NOISING_A_CONFIG_SWITCH(
                     tile_size_m_noising_A, tile_size_k_noising_A, r,
                     pipeline_stages_noising_A, AxEBL_noising_dtype,
                     kernel_found_noising_a = true;
                     run_pearl_noising_A_<ElementDenoise_AxEBL, R_, bM_, bK_,
                                          stages_>(params, stream););
-              } else { kernel_found_noising_a = true; }
+              } else if (!use_sm120_fallback) { kernel_found_noising_a = true; }
 
-              if (run_noising_b) {
+              if (!use_sm120_fallback && run_noising_b) {
                 NOISING_B_CONFIG_SWITCH(
                     tile_size_n_noising_B, tile_size_k_noising_B, r,
                     pipeline_stages_noising_B, EARxBpEB_noising_dtype,
                     kernel_found_noising_b = true;
                     run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
                                          stages_>(params, stream););
-              } else { kernel_found_noising_b = true; }
+              } else if (!use_sm120_fallback) { kernel_found_noising_b = true; }
 
               if (do_denoise_conversion) {
                 if (params.r == 64) {
@@ -905,7 +1057,14 @@ void noisy_gemm(
                               "given config: R = ",
                               r);
                 }
-              } MATMUL_CONFIG_SWITCH(bM, bN, bK, r, pipeline_stages, cM, cN,
+              }
+              
+              // Main GEMM kernel has built-in SM120 paths (__CUDA_ARCH__ >= 1000)
+              // Uses SM80-style MMA instead of SM90 WGMMA, manual S2R copies, etc.
+              // Noising uses dedicated SM120 fallback for correctness; mainloop uses
+              // kernel's native SM120 support with PoW extraction integrated.
+              
+              MATMUL_CONFIG_SWITCH(bM, bN, bK, r, pipeline_stages, cM, cN,
                                      kernel_found_matmul = true;
                                      run_pearl_gemm_<
                                          ElementOut, R_, bM_, bN_, bK_, stages_,

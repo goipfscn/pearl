@@ -56,6 +56,14 @@ struct KernelTraits {
   static constexpr int kNumThreads = kNumMmaThreads + 128;
   static constexpr int kNumWarps = kNumThreads / cutlass::NumThreadsPerWarp;
 
+  // Warp tiling constants. Used both for the SM80 mma.sync atom layout
+  // (Blackwell port) and for the reduce_buffer permutation. 4 warps per
+  // MMA warpgroup, each warp owning 16 rows of the per-WG accumulator.
+  static constexpr int kWarpRows = 4 * kNumMmaWarpgroups;
+  static constexpr int kWarpCols = 1;
+  using MMAWarpLayout = Layout<Shape<Int<kWarpRows>, Int<kWarpCols>, _1>>;
+  using MMAWarpTileShape = Shape<_16, _8, _32>;
+
   using TileShape_MNK = Shape<Int<bM>, Int<bN>, Int<bK>>;
   // used for denoising
   using TileShape_MNR = Shape<Int<bM>, Int<bN>, Int<R>>;
@@ -63,6 +71,7 @@ struct KernelTraits {
   static constexpr int kClusterSizeM = cM_;
   static constexpr int kClusterSizeN = cN_;
   using ClusterShape_MNK = Shape<Int<kClusterSizeM>, Int<kClusterSizeN>, _1>;
+
   // Multicasting to a single CTA has been known to be worse perf than non-multicast
   using TMAOpA =
       std::conditional_t<(kClusterSizeN > 1), cute::SM90_TMA_LOAD_MULTICAST,
@@ -71,21 +80,23 @@ struct KernelTraits {
       std::conditional_t<(kClusterSizeM > 1), cute::SM90_TMA_LOAD_MULTICAST,
                          cute::SM90_TMA_LOAD>;
   // GEMM traits
-  using AtomLayoutMNK = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+  //
+  // Blackwell port (sm_120a / sm_121a — GB10, RTX 50-series): WGMMA is not
+  // available on consumer Blackwell. Replace the Hopper SM90 WGMMA atom with a
+  // 4-warp-per-warpgroup tile of SM80 mma.sync 16x8x32 int8 atoms. The
+  // per-thread accumulator-fragment layout is bit-identical to Hopper because
+  // Hopper CLayout_64xN was constructed exactly this way (4 warps in M × N/8
+  // atoms across × interleaved (v1,v0) value packing). This preserves
+  // PoUW-relevant xor_reduction(tCrC) outputs bit-for-bit.
+  using AtomLayoutMNK = Layout<Shape<Int<kWarpRows>, _1, _1>>;
   using TiledMma = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<ElementIn, ElementIn, ElementAccum,
-                                 TileShape_MNK>(),
-      AtomLayoutMNK{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMNK{},
+      cute::Tile<cute::Underscore, cute::Int<bN>, cute::Underscore>{}));
   using MMATraits = typename TiledMma::Atom::Traits;
   using MMAAtomShape_MNK = typename TiledMma::AtomShape_MNK;
   using MMAAtom_K = decltype(get<2>(MMAAtomShape_MNK{}));
 
-  // Fake warp layout and warp tile shape for reduce_buffer permutation
-  // We assume <= 2 MMA warpgroups which are always tiled in the M direction.
-  static constexpr int kWarpRows = 4 * kNumMmaWarpgroups;
-  static constexpr int kWarpCols = 1;
-  using MMAWarpLayout = Layout<Shape<Int<kWarpRows>, Int<kWarpCols>, _1>>;
-  using MMAWarpTileShape = Shape<_16, _8, _32>;
 
   using SmemLayoutAtomA =
       decltype(cutlass::gemm::collective::detail::ss_smem_selector<
@@ -139,12 +150,14 @@ struct KernelTraits {
       Layout<Shape<_1>, Stride<_1>>{}));
 
   // Denoising
-  // MMA
-  using AtomLayoutMNR = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+  // MMA — Blackwell SM80 mma.sync 16x8x16 fp16 atoms tiled the same way as
+  // the main GEMM (kWarpRows warps in M, bN expansion via permutation). See
+  // the main-GEMM commentary above for the bit-identicality argument.
+  using AtomLayoutMNR = Layout<Shape<Int<kWarpRows>, _1, _1>>;
   using TiledMmaDenoise = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<ElementDenoise, ElementDenoise,
-                                 ElementDenoiseAccum, TileShape_MNR>(),
-      AtomLayoutMNR{}));
+      cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>{},
+      AtomLayoutMNR{},
+      cute::Tile<cute::Underscore, cute::Int<bN>, cute::Underscore>{}));
   // SMEM layouts
   using SmemLayoutEAL_Atom =
       decltype(cutlass::gemm::collective::detail::ss_smem_selector<
