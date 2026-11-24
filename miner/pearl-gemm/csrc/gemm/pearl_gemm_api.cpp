@@ -1041,7 +1041,19 @@ void noisy_gemm(
                               "given config: R = ",
                               r);
                 }
-              } MATMUL_CONFIG_SWITCH(bM, bN, bK, r, pipeline_stages, cM, cN,
+              }
+              
+              // SM120 main GEMM limitation: WGMMA-based mainloop requires SM90 (Hopper)
+              // Blackwell (SM120/CC12.0) does not support WGMMA instructions
+              TORCH_CHECK(!use_sm120_fallback || SkipReduction,
+                          "SM120 (Blackwell) main GEMM with PoW extraction not yet implemented. ",
+                          "Current mainloop uses SM90 WGMMA which is unavailable on CC 12.0. ",
+                          "Noising kernels (noise_A/B) now work on SM120 via global-memory fallback. ",
+                          "Main GEMM requires either: (1) CUDA-core based GEMM kernel for SM120, ",
+                          "or (2) cuBLAS integration with custom PoW extraction. ",
+                          "Contact development team for SM120 mining support.");
+              
+              MATMUL_CONFIG_SWITCH(bM, bN, bK, r, pipeline_stages, cM, cN,
                                      kernel_found_matmul = true;
                                      run_pearl_gemm_<
                                          ElementOut, R_, bM_, bN_, bK_, stages_,
