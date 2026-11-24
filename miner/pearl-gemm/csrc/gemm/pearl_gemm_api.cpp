@@ -934,12 +934,76 @@ void noisy_gemm(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+  // SM120 (Blackwell CC 12.0) fallback detection
+  bool use_sm120_fallback = (dprops->major >= 10);
+
+  // SM120 shared memory validation: main GEMM with certain tile/stage/R configs
+  // exceeds device limits on Blackwell. Filter unsupported combinations.
+  if (use_sm120_fallback) {
+    // Conservative estimate: reject tile configs that request >100KB shared memory
+    // Actual device limit on Blackwell RTX PRO 5000: ~101376 bytes per block
+    // High-R (128) with large tiles (128x128x64) and stages can exceed this
+    size_t estimated_smem_bytes = 
+        (bM * bK + bN * bK) * sizeof(int8_t) * pipeline_stages +  // A/B tiles
+        (bM * bN) * sizeof(cutlass::bfloat16_t) +                 // C accumulator fragment
+        r * (bM + bN) * sizeof(int16_t);                          // denoise scratch
+
+    size_t device_smem_limit = dprops->sharedMemPerBlock;
+    
+    TORCH_CHECK(estimated_smem_bytes <= device_smem_limit,
+                "Requested tile configuration exceeds SM120 shared memory limit: ",
+                "estimated ", estimated_smem_bytes, " bytes, device limit ",
+                device_smem_limit, " bytes. Try smaller tile sizes (bM/bN/bK), ",
+                "fewer pipeline stages, or lower noise rank R.");
+  }
+
   bool kernel_found_matmul = false;
   bool kernel_found_noising_a = false;
   bool kernel_found_noising_b = false;
 
   bool do_denoise_conversion =
       (int32_noising_EARxBpEB || int32_noising_AxEBL) && (!skip_denoising);
+
+  // Run SM120 fallback noising kernels if on Blackwell
+  if (use_sm120_fallback) {
+    if (run_noising_a) {
+      bool convert_AxEBL = (AxEBL_noising_dtype == torch::kFloat16);
+      pearl::launch_noise_A_sm120(
+          static_cast<const int8_t*>(A.data_ptr()),
+          static_cast<const int8_t*>(EAL.data_ptr()),
+          AxEBL_noising_dtype == torch::kFloat16 ? AxEBL_fp16.data_ptr() : AxEBL_int32.data_ptr(),
+          static_cast<int8_t*>(ApEA.data_ptr()),
+          static_cast<const int8_t*>(EAR_K_major.data_ptr()),
+          static_cast<const int8_t*>(EBL_K_major.data_ptr()),
+          m, k, r,
+          convert_AxEBL,
+          stream
+      );
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      kernel_found_noising_a = true;
+    } else {
+      kernel_found_noising_a = true;
+    }
+
+    if (run_noising_b) {
+      bool convert_EARxBpEB = (EARxBpEB_noising_dtype == torch::kFloat16);
+      pearl::launch_noise_B_sm120(
+          static_cast<const int8_t*>(B.data_ptr()),
+          static_cast<const int8_t*>(EBR.data_ptr()),
+          EARxBpEB_noising_dtype == torch::kFloat16 ? EARxBpEB_fp16.data_ptr() : EARxBpEB_int32.data_ptr(),
+          static_cast<int8_t*>(BpEB.data_ptr()),
+          static_cast<const int8_t*>(EAR_K_major.data_ptr()),
+          static_cast<const int8_t*>(EBL_K_major.data_ptr()),
+          n, k, r,
+          convert_EARxBpEB,
+          stream
+      );
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      kernel_found_noising_b = true;
+    } else {
+      kernel_found_noising_b = true;
+    }
+  }
 
   DEBUG_MODE_SWITCH(
       enable_debug, EnableDebug,
@@ -948,23 +1012,23 @@ void noisy_gemm(
           SKIP_DENOISING_SWITCH(
               skip_denoising, SkipDenoising,
 
-              if (run_noising_a) {
+              if (!use_sm120_fallback && run_noising_a) {
                 NOISING_A_CONFIG_SWITCH(
                     tile_size_m_noising_A, tile_size_k_noising_A, r,
                     pipeline_stages_noising_A, AxEBL_noising_dtype,
                     kernel_found_noising_a = true;
                     run_pearl_noising_A_<ElementDenoise_AxEBL, R_, bM_, bK_,
                                          stages_>(params, stream););
-              } else { kernel_found_noising_a = true; }
+              } else if (!use_sm120_fallback) { kernel_found_noising_a = true; }
 
-              if (run_noising_b) {
+              if (!use_sm120_fallback && run_noising_b) {
                 NOISING_B_CONFIG_SWITCH(
                     tile_size_n_noising_B, tile_size_k_noising_B, r,
                     pipeline_stages_noising_B, EARxBpEB_noising_dtype,
                     kernel_found_noising_b = true;
                     run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
                                          stages_>(params, stream););
-              } else { kernel_found_noising_b = true; }
+              } else if (!use_sm120_fallback) { kernel_found_noising_b = true; }
 
               if (do_denoise_conversion) {
                 if (params.r == 64) {
