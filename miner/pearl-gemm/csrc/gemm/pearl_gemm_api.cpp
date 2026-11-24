@@ -502,6 +502,7 @@ void noise_B(at::Tensor& B,                          // n x k
         convert_EARxBpEB,
         stream
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
 
